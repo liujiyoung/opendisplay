@@ -19,4 +19,25 @@ final class RemoteInputTests: XCTestCase {
         XCTAssertEqual(chunks.map { String(decoding: $0, as: UTF16.self) }.joined(), text)
         XCTAssertTrue(RemoteInput.textChunks("").isEmpty)
     }
+
+    func testIPadCapsLockDoesNotLeakIntoLettersOrPointerModifiers() {
+        let caps: UInt64 = 1 << 16
+        let shift: UInt64 = 1 << 17
+        let command: UInt64 = 1 << 20
+        XCTAssertEqual(RemoteInput.iPadModifiers(caps), 0)
+        XCTAssertEqual(RemoteInput.iPadModifiers(caps | shift | command), shift | command)
+        XCTAssertEqual(RemoteInput.iPadModifiers(UInt64.max), RemoteInput.modifierMask & ~caps)
+    }
+
+    func testCapsLockSwitchesOncePerPressAndRecoversAfterFocusLoss() {
+        var key = InputSourceSwitchKey()
+        XCTAssertTrue(key.update(down: true))
+        XCTAssertFalse(key.update(down: true)) // key repeat/long press
+        XCTAssertFalse(key.update(down: false))
+        XCTAssertFalse(key.update(down: false))
+        XCTAssertTrue(key.update(down: true)) // next tap switches back
+        key.reset() // app switch or cable loss while held
+        XCTAssertFalse(key.update(down: false))
+        XCTAssertTrue(key.update(down: true))
+    }
 }

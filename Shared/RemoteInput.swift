@@ -7,6 +7,12 @@ enum RemoteInput {
     static let relativePointerCapability = 2
     static let modifierMask: UInt64 = 0x00BF0000 // caps, shift, control, option, command, keypad, fn
 
+    /// The iPad's Caps Lock is an input-source switch, so its local latch must
+    /// never make subsequently forwarded letters or pointer events uppercase.
+    static func iPadModifiers(_ flags: UInt64) -> UInt64 {
+        flags & modifierMask & ~(1 << 16)
+    }
+
     static func macKeyCode(forHID usage: Int) -> UInt16? { keyCodes[usage] }
 
     private static let keyCodes: [Int: UInt16] = [
@@ -39,4 +45,17 @@ enum RemoteInput {
         if !chunk.isEmpty { result.append(chunk) }
         return result
     }
+}
+
+/// A held/repeated Caps Lock press switches once; the next press switches back.
+struct InputSourceSwitchKey {
+    private var held = false
+
+    mutating func update(down: Bool) -> Bool {
+        let shouldSwitch = down && !held
+        held = down
+        return shouldSwitch
+    }
+
+    mutating func reset() { held = false }
 }

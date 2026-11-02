@@ -2,6 +2,8 @@
 
 This fork adds iPad hardware keyboard and trackpad forwarding, an optional native text input mode, hidden-by-default controls, and a post-login Mac sender launcher. With matching builds, the full-screen iPad captures relative trackpad input so the Mac cursor and held drags can cross between the iPad and other connected displays, following the Mac's display arrangement.
 
+Caps Lock on the iPad keyboard switches the Mac's input source through Control-Space. Use Shift for uppercase letters, and keep the Mac's previous-input-source shortcut set to Control-Space.
+
 Three-finger tap the **iPad screen** to show or hide controls. Opening controls releases pointer capture; hiding them resumes capture. The compact controls appear at the top right, leaving the Mac Dock unobstructed.
 
 [中文构建与使用说明](LOCAL_SETUP.zh-CN.md) · Based on upstream commit `4e7c1f11597aeede1d62b7f38c2f556331b800d3` · GPL-3.0, original attribution retained.

@@ -996,7 +996,7 @@ struct VideoLayerView: UIViewRepresentable {
             guard recognizer.state == .began || recognizer.state == .changed,
                   let p = normalized(recognizer.location(in: self)) else { return }
             receiver?.sendPointer(phase: "move", x: p.x, y: p.y,
-                                  modifiers: UInt64(recognizer.modifierFlags.rawValue))
+                                  modifiers: RemoteInput.iPadModifiers(UInt64(recognizer.modifierFlags.rawValue)))
         }
 
         private func sendPointer(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?) {
@@ -1010,7 +1010,8 @@ struct VideoLayerView: UIViewRepresentable {
             }
             let wirePhase = phase == "began" ? "down" : phase == "moved" ? "move" : "up"
             receiver?.sendPointer(phase: wirePhase, x: p.x, y: p.y, button: pointerButton,
-                                  clicks: touch.tapCount, modifiers: UInt64(event?.modifierFlags.rawValue ?? 0))
+                                  clicks: touch.tapCount,
+                                  modifiers: RemoteInput.iPadModifiers(UInt64(event?.modifierFlags.rawValue ?? 0)))
         }
 
         private let cursorLayer: CALayer = {
