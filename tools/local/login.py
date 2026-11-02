@@ -27,7 +27,8 @@ domain = f'gui/{os.getuid()}'
 config = {
     'Label': label,
     'ProgramArguments': ['/usr/bin/caffeinate', '-s', '/usr/bin/open', '-W', '-a', str(app), '--args',
-                         '-mode', 'extend', '-presentation', 'menuBar', '-autostart', 'YES'],
+                         '-mode', 'extend', '-presentation', 'menuBar', '-autostart', 'YES',
+                         '-autoReconnectWiFi', 'YES'],
     'WorkingDirectory': str(root),
     'RunAtLoad': True,
     'KeepAlive': True,

@@ -4,6 +4,8 @@ This fork adds iPad hardware keyboard and trackpad forwarding, an optional nativ
 
 Caps Lock on the iPad keyboard switches the Mac's input source through Control-Space. Use Shift for uppercase letters, and keep the Mac's previous-input-source shortcut set to Control-Space.
 
+The local post-login launcher keeps waiting for previously connected Wi-Fi receivers, including when the iPad app opens later. Receiver connections use the local network directly when a system proxy is enabled. USB remains preferred; Bluetooth transport is not supported. FileVault unlock and the first graphical login are required before the launcher can run.
+
 Three-finger tap the **iPad screen** to show or hide controls. Opening controls releases pointer capture; hiding them resumes capture. The compact controls appear at the top right, leaving the Mac Dock unobstructed.
 
 [中文构建与使用说明](LOCAL_SETUP.zh-CN.md) · Based on upstream commit `4e7c1f11597aeede1d62b7f38c2f556331b800d3` · GPL-3.0, original attribution retained.

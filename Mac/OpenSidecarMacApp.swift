@@ -246,7 +246,8 @@ final class SenderController: ObservableObject {
     //    reshuffle — the earlier no-switching policy existed because
     //    migration used to mean destroying and recreating the session.
     //  - WiFi devices the user connected before (wifiRemembered) reconnect
-    //    in a short window at LAUNCH only — never mid-session.
+    //    in a short window at LAUNCH. The opt-in headless launcher keeps
+    //    waiting for those remembered devices with -autoReconnectWiFi YES.
     // `-autostart NO` disables all auto-connecting, including migrations.
     private var usbDisabled = Set(UserDefaults.standard.stringArray(forKey: "usbDisabled") ?? []) {
         didSet { UserDefaults.standard.set(Array(usbDisabled), forKey: "usbDisabled") }
@@ -264,12 +265,15 @@ final class SenderController: ObservableObject {
     }
     private let autoConnectEnabled = UserDefaults.standard.object(forKey: "autostart") == nil
         || UserDefaults.standard.bool(forKey: "autostart")
+    private let autoReconnectWiFi = UserDefaults.standard.bool(forKey: "autoReconnectWiFi")
 
     // Bonjour usually reports devices before usbmuxd does — WiFi reconnects
     // wait out this window so a cabled device is dialed over USB first. The
     // deadline closes the window for good: a remembered WiFi device that
     // appears later was brought near the Mac mid-session, which is a user
-    // action to confirm, not auto-grab.
+    // action to confirm, not auto-grab. The headless opt-in removes this
+    // deadline only for previously remembered receivers; Disconnect still
+    // removes a device from that list.
     private var wifiAutoConnectArmed = false
     private let wifiAutoConnectDeadline = Date().addingTimeInterval(12)
     // Services whose Bonjour record is currently seen over the direct
@@ -405,7 +409,7 @@ final class SenderController: ObservableObject {
                 connect(to: .usb(udid: device.udid))
             }
         }
-        guard wifiAutoConnectArmed, Date() < wifiAutoConnectDeadline else { return }
+        guard wifiAutoConnectArmed, autoReconnectWiFi || Date() < wifiAutoConnectDeadline else { return }
         for result in discovered {
             let target = ConnectionTarget.wifi(result)
             if wifiRemembered.contains(target.sessionID),

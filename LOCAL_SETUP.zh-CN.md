@@ -15,6 +15,8 @@
 
 已在 M4 Mac mini 与 11 英寸 M1 iPad Pro / 苹果妙控键盘上验证画面、键盘、触控板和输入法。USB 使用 2388×1668 HEVC，流内统计通常约 60 fps；该统计不是完整输入到光子的硬件延迟测量。151 项 Mac 单元测试及 2 项 iPad UIKit 回归测试覆盖跨屏坐标、拖动后的双击状态、视频布局、硬件键盘输入，以及 Caps Lock 单次触发和修饰键过滤。
 
+已实测：拔掉 Mac 外接显示器后，可仅用 iPad 经 Wi-Fi 显示和控制；在此无显示器状态下，Wi-Fi → USB → Wi-Fi 自动切换正常。无外接显示器时正常退出发送端，LaunchAgent 能自动拉起应用、创建虚拟显示器并重连 Wi-Fi。以上是已登录图形会话内的测试，不能替代冷启动验收。
+
 **冷启动、FileVault 预启动解锁、普通锁屏恢复及所有布局/快捷键组合尚未全部验收。** 自动启动项在用户登录后运行，不能替代登录前的画面和解锁步骤。
 
 ## 连接方式
@@ -29,6 +31,16 @@ Mac → USB-C 数据线 → **iPad 机身 USB-C 口**。妙控键盘通过 Smart
 6. 同时连接外接显示器时，在 Mac 的 **系统设置 → 显示器 → 排列** 中确认两块屏幕的位置，再沿相邻边缘移动。iPad 保持全屏且工具条关闭，才能持续捕获触控板；三指轻点 iPad 屏幕可释放捕获并打开工具条。
 
 正常使用时保持 iPad 应用在前台。断线后重插数据线，发送端会重连。主动点击 Disconnect 会记住断开选择，需要手动 Connect 恢复。
+
+| 传输方式 | 支持与条件 |
+| --- | --- |
+| USB-C 数据线 | 支持；通过系统 usbmuxd 传输画面和键鼠，优先使用，不依赖 Wi-Fi。插入 iPad 机身接口，保持信任配对。 |
+| Wi-Fi / 同一局域网 | 支持；Bonjour 发现、TCP 传输，两端需要本地网络权限。Mac 也可用网线接同一路由器，iPad 使用 Wi-Fi。首次在 Mac 点击 Connect，之后会记住该接收端。 |
+| 蓝牙直连 | 不支持；此项目没有蓝牙画面或控制传输。妙控键盘通过 Smart Connector 接到 iPad，其输入与画面共同走 USB 或局域网。 |
+
+有线会优先于 Wi-Fi；拔线时，如果能发现同一 iPad 的局域网服务，会尝试切换到 Wi-Fi，重新插线时再切回 USB。Wi-Fi 不要求互联网，但需要两端能够互访；访客网络隔离会阻止连接。当前没有配置跨网远程访问或无需路由器的无线直连。
+
+OpenDisplay 的接收设备连接及有线链路探测显式使用局域网直连，避免系统 SOCKS/HTTP 代理接管设备流量或把代理回环误判为有线链路。此设置仅作用于应用的设备连接，不修改系统代理或 GitHub 的 Git 代理配置。
 
 ## 构建
 
@@ -93,7 +105,7 @@ python3 tools/local/login.py preview
 python3 tools/local/login.py install
 ```
 
-启动项通过 Launch Services 打开应用，使用 `open -W` 保持单实例，并通过 `caffeinate -s` 在运行期间阻止系统休眠。它会在应用退出后重启应用；需要正常退出时先移除启动项：
+启动项通过 Launch Services 打开应用，使用 `open -W` 保持单实例，并通过 `caffeinate -s` 在运行期间阻止系统休眠。启动参数 `-autoReconnectWiFi YES` 让它持续等待此前手动连接过的 Wi-Fi 接收端，允许开机登录一段时间后才打开 iPad 应用；普通启动仍保留上游的 12 秒窗口。它会在应用退出后重启应用；需要正常退出时先移除启动项：
 
 ```sh
 python3 tools/local/login.py uninstall
@@ -105,9 +117,13 @@ Mac 运行日志位于 `~/Library/Logs/OpenDisplay Dev/`。iPad 连接日志可�
 
 ## 无头启动的边界
 
+此启动项属于当前用户的 Aqua 图形会话：**用户登录后自启动，不是 FileVault 解锁前的系统服务。** 只有 SSH shell 登录并不等于已建立图形登录会话。FileVault 等待解锁、停留在登录窗口且用户会话尚未建立时，OpenDisplay 不能提供登录画面，也不能靠 iPad 中的 OpenDisplay 自行完成开机解锁。
+
 先确认 iPad 的画面和输入正常，再断开原显示器的视频连接，验证 iPad 成为唯一显示器。第一次验收时保留恢复用的显示器和键盘。
 
 Apple 文档说明：Apple 芯片 Mac 在 macOS 26 及以上、开启 Remote Login 且网络可用时，可通过 SSH 解锁 FileVault。见 [Apple 官方说明](https://support.apple.com/en-ca/guide/security/sec8447f5049/web)。是否能在具体网络的预启动环境连通，以及解锁后能否恢复用户会话，需要单独实测；此分支不会关闭 FileVault 或自动设置登录。
+
+保留 FileVault 时，可先在 iPad 的 SSH 客户端配置 Mac 的局域网地址、端口 22、允许解锁 FileVault 的本地用户名，以及**密码认证**。先在正常运行时验证登录，再安排重启测试；密码仅在 SSH 客户端中输入。预启动阶段无法使用数据卷里的普通 SSH 密钥认证配置。成功解锁后 SSH 会暂时断开，等待 macOS 启动，再打开 iPad 的 OpenDisplay。若用户图形会话仍未建立，须先完成图形登录；不要把 SSH shell 登录视为图形登录。预启动可用网络条件见 [Apple FileVault 网络要求](https://support.apple.com/guide/deployment/dep82064ec40/web)。
 
 ## 协议扩展
 

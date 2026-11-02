@@ -1862,6 +1862,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             let tcp = NWProtocolTCP.Options()
             tcp.noDelay = true
             let params = NWParameters(tls: nil, tcp: tcp)
+            params.preferNoProxies = true // probe the peer's cable, not a loopback proxy
             params.prohibitedInterfaceTypes = [.wifi, .cellular]
             let probe = NWConnection(host: host, port: 9000, using: params)
             upgradeProbes.append(probe)
@@ -1976,6 +1977,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // pre-dial was tried and only ever hung until its timeout, adding 2s
         // to every connect. becomeReady reports which path won.
         let params = NWParameters(tls: nil, tcp: options)
+        // This is the receiver's local device connection. A system SOCKS/HTTP
+        // proxy can otherwise accept on lo0 and close before the peer's hello,
+        // or make a WiFi connection look like a direct cable to path detection.
+        params.preferNoProxies = true
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
         // A dial to a withdrawn Bonjour service (receiver asleep or app
