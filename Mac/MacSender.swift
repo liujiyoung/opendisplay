@@ -2355,6 +2355,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         closeCursorChannel()
         let params = NWParameters.udp
+        params.preferNoProxies = true // the cursor uses the same direct LAN path as video
         params.serviceClass = .responsiveData
         let udp = NWConnection(host: host, port: udpPort, using: params)
         cursorNetworkLock.lock()

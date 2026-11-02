@@ -116,6 +116,34 @@ python3 tools/local/login.py uninstall
 
 Mac 运行日志位于 `~/Library/Logs/OpenDisplay Dev/`。iPad 连接日志可在应用 Settings & Help 中查看。个人签名、设备标识和本机路径只保留在本地配置与日志中。
 
+## 无线延迟对比
+
+先使用同一 Wi-Fi、设备位置、画质、分辨率和动态负载，预热后分别采集每次修改前后约 60 秒。正式采样时不构建应用、不切换 iPad 应用、不插拔数据线。混入 USB、重连或画质切换的样本会被脚本拒绝；真实的延迟尖峰和超时单独保留，避免只挑选流畅窗口。
+
+测量开关默认关闭。启动 iPad 应用时追加 `-- -measureLatency YES`，并使用支持 `welcome.latencyProbes: 1` 的 Mac 测量版。每秒五个探针经 iPad → Mac 光标队列 → 实际光标返回路径 → iPad 主线程更新，用同一 iPad 单调时钟计时。它是应用层光标往返时间，不含手指采样和屏幕扫描；普通应用 RTT 另行记录。均值从全部原始样本计算，不能平均各窗口的中位数。
+
+```sh
+python3 tools/local/login.py install --test-pattern
+python3 tools/local/latency.py --label step1-before --windows 12 --warmup 10
+```
+
+动态测试窗口跟随目标虚拟显示器的位置和 HiDPI 缩放变化，须确认在 iPad 上播放后开始采样。结果保存在忽略提交的 `build/Measurements/`。测试结束用 `python3 tools/local/login.py install` 恢复普通桌面；iPad 退出后不带 `-measureLatency YES` 重开即可关闭探针。
+
+### UDP 修复验证（2026-11-02）
+
+Mac mini 与 M1 iPad Pro 在同一局域 Wi-Fi 下，保持 Best、HEVC、2388×1668、目标 60 fps 和同一动态测试画面；每轮采集约 61.6 秒。测试窗口已核对位于 iPad 虚拟桌面，未使用误显示在外接显示器时的样本。
+
+| 指标 | 修复前 | UDP 修复后 |
+| --- | ---: | ---: |
+| 光标应用层往返算术均值（各 308 个样本） | 6.91 ms | 6.36 ms |
+| 光标往返 P95 | 9.29 ms | 8.37 ms |
+| 普通应用 RTT 算术均值（各 30 个样本） | 6.54 ms | 6.60 ms |
+| 光标 TCP / UDP 样本数 | 308 / 0 | 0 / 308 |
+| UDP 确认窗口 / 总窗口 | 0 / 12 | 12 / 12 |
+| 探针超时 | 0 | 0 |
+
+修复将 UDP 首包的送达确认与 TCP/UDP 共用的显示序号去重分开，并让 UDP 使用直连局域网路径。TCP 镜像先到不会再抑制 UDP 回执；新 UDP 流也不会倒退显示序号。此次光标均值下降约 8%，普通 RTT 基本持平，证实 UDP 通道恢复；单组低负载对比不能证明拥塞时的卡顿或物理操作到显示的延迟已解决。原始数据分别保存在本机 `build/Measurements/step1-before-udp.json` 和 `step1-after-udp.json`。
+
 ## 无头启动的边界
 
 此启动项属于当前用户的 Aqua 图形会话：**用户登录后自启动，不是 FileVault 解锁前的系统服务。** 只有 SSH shell 登录并不等于已建立图形登录会话。FileVault 等待解锁、停留在登录窗口且用户会话尚未建立时，OpenDisplay 不能提供登录画面，也不能靠 iPad 中的 OpenDisplay 自行完成开机解锁。

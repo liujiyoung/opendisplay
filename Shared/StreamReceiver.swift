@@ -117,7 +117,7 @@ final class StreamReceiver: ObservableObject {
     var powerActions: [PowerAction] = []
     /// Called on the main thread once a power action passed the gate.
     var onPowerAction: ((PowerAction) -> Void)?
-    private var lastCursorSeq: UInt64 = 0
+    private var cursorSequence = CursorSequenceState()
     // Cursor channel health for the HUD/stats: how many positions landed and
     // how many datagrams never did (sequence gaps + reordered drops). A
     // stuttering pointer with a healthy count means the drawing side; a low
@@ -517,10 +517,11 @@ final class StreamReceiver: ObservableObject {
             guard let self, self.cursorListener === udp else { conn.cancel(); return }
             // A UDP "connection" is one remote host:port flow. The newest
             // one is the live sender (a rebuilt sender socket gets a fresh
-            // ephemeral port) and starts its sequence over.
+            // ephemeral port). Its delivery ACK is fresh, but presentation
+            // ordering still belongs to the current TCP sender session.
             self.cursorConnection?.cancel()
             self.cursorConnection = conn
-            self.lastCursorSeq = 0
+            self.cursorSequence.beginUDPFlow()
             conn.stateUpdateHandler = { [weak self] state in
                 guard let self, self.cursorConnection === conn else { return }
                 if case .failed(let error) = state {
@@ -566,6 +567,7 @@ final class StreamReceiver: ObservableObject {
         cursorListener = nil
         cursorListenerReady = false
         cursorPortAnnounced = false
+        cursorSequence.beginUDPFlow()
     }
 
     private func receiveCursorDatagrams(on conn: NWConnection) {
@@ -580,25 +582,17 @@ final class StreamReceiver: ObservableObject {
         }
     }
 
-    /// One datagram = one cursor JSON plus `s`, a per-flow sequence. UDP can
-    /// reorder, and a stale position after a fresh one reads as jitter, so
-    /// anything at or below the last seen sequence is dropped.
+    /// Acknowledge delivery independently of presentation order. A TCP mirror
+    /// may already have applied the same or a newer sequence before UDP arrives.
     private func handleCursorDatagram(_ data: Data) {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
               obj["type"] as? String == "cursor",
               let seq = (obj["s"] as? NSNumber)?.uint64Value else { return }
-        // Loss accounting only; the floor itself is enforced in applyCursor,
-        // shared with TCP. Counts run slightly hot during the brief window
-        // where the sender still mirrors to TCP (duplicates read as drops).
-        guard seq > lastCursorSeq else { cursorLostThisWindow += 1; return }
-        if lastCursorSeq == 0 {
-            // First datagram of this flow: tell the sender the channel truly
-            // delivers (UDP .ready proves only a local route — a firewalled
-            // port would otherwise eat the cursor forever, PROTOCOL.md 6.3).
+        let delivery = cursorSequence.receiveUDP(seq)
+        cursorLostThisWindow += delivery.lost
+        if delivery.acknowledge {
             Log.info("cursor channel: receiving datagrams")
             sendControl(["type": "cursorAck"])
-        } else {
-            cursorLostThisWindow += Int(seq - lastCursorSeq - 1)
         }
         applyCursor(obj, path: "UDP")
     }
@@ -716,7 +710,7 @@ final class StreamReceiver: ObservableObject {
         cursorConnection?.cancel()
         cursorConnection = nil
         resetStreamState()
-        lastCursorSeq = 0   // the sender restarts its cursor sequence per session
+        cursorSequence.resetSession()
         cursorPortAnnounced = false
         // Hide the previous sender's cursor: replayed into a fresh video view
         // it would ghost over a new sender that never sends one (mirror mode
@@ -974,8 +968,7 @@ final class StreamReceiver: ObservableObject {
     /// TCP frames; those apply unconditionally, as before.
     private func applyCursor(_ obj: [String: Any], path: String = "TCP") {
         if let seq = (obj["s"] as? NSNumber)?.uint64Value {
-            guard seq > lastCursorSeq else { return }
-            lastCursorSeq = seq
+            guard cursorSequence.acceptForPresentation(seq) else { return }
         }
         let visible = (obj["v"] as? Int ?? 0) == 1
         let x = obj["x"] as? Double ?? 0

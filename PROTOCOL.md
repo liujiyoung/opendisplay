@@ -482,13 +482,18 @@ UDP where a lost or late datagram costs nothing: the next one supersedes it.
   queued behind video can arrive after a newer datagram). The sequence is
   per TCP session: it restarts when the TCP connection is (re-)established
   and runs across both paths. The receiver resets its tracker on every new
-  TCP connection and on every new UDP flow, and accepts datagrams only
-  from the most recently seen flow. A TCP `cursor` frame without `s` (an
+  TCP connection, and accepts datagrams only from the most recently seen
+  flow. A new UDP flow resets only its delivery-confirmation and UDP loss
+  accounting state; it MUST NOT rewind the shared presentation sequence.
+  A TCP `cursor` frame without `s` (an
   older sender) applies unconditionally.
 * **Delivery confirmation.** `.ready` on a UDP socket proves only a local
   route — a firewalled port would swallow the cursor silently. On the
-  first accepted datagram of a flow the receiver sends `cursorAck` (a
-  control message with no other fields) over TCP. Until it arrives the
+  first valid datagram of a flow the receiver sends `cursorAck` (a
+  control message with no other fields) over TCP, even if a TCP mirror has
+  already presented that sequence or a newer one. Delivery confirmation is
+  independent of whether this position is accepted for presentation.
+  Until it arrives the
   sender MUST keep mirroring every position onto TCP (same `s`, so the
   receiver deduplicates); if no ack arrives within a few seconds the
   sender SHOULD drop the UDP flow and stay on TCP. A receiver that stops
