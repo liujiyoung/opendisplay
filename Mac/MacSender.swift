@@ -88,6 +88,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private let endpointName: String
     private let mode: CaptureMode
     private let quality: StreamQuality
+    private var adaptiveBitrateEnabled: Bool
     // Stable per-device serial for the virtual display, so macOS can tell
     // multiple OpenDisplay monitors apart and persist their arrangement.
     private let displaySerial: UInt32
@@ -381,12 +382,15 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var baseBitrate = 0
 
     init(transport: SenderTransport, name: String, mode: CaptureMode,
-         quality: StreamQuality = .best, displaySerial: UInt32 = 0x0001,
+         quality: StreamQuality = .best,
+         adaptiveBitrateEnabled: Bool = AdaptiveVideoBitratePreference.isEnabled(),
+         displaySerial: UInt32 = 0x0001,
          identityOffset: UInt32 = 0, awaitingWake: Bool = false) {
         self.transport = transport
         self.endpointName = name
         self.mode = mode
         self.quality = quality
+        self.adaptiveBitrateEnabled = adaptiveBitrateEnabled
         self.displaySerial = displaySerial
         self.baseIdentityOffset = identityOffset
         self.awaitingWake = awaitingWake
@@ -2958,12 +2962,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // MARK: - Capture callback
 
+    func setAdaptiveBitrateEnabled(_ enabled: Bool) {
+        queue.async { [weak self] in
+            guard let self, !self.stopped, self.adaptiveBitrateEnabled != enabled else { return }
+            self.adaptiveBitrateEnabled = enabled
+            self.resetAdaptiveVideoBitrate()
+            Log.info("adaptive bitrate preference: \(enabled ? "enabled" : "disabled")")
+        }
+    }
+
     private func resetAdaptiveVideoBitrate() {
         guard baseBitrate > 0, encoder != nil else { return }
         let now = ProcessInfo.processInfo.systemUptime
         adaptiveVideoBitrate = nil
-        if case .tcp = transport, !currentPathDirectLink,
-           !UserDefaults.standard.bool(forKey: "disableAdaptiveBitrate") {
+        if case .tcp = transport, !currentPathDirectLink, adaptiveBitrateEnabled {
             #if DEBUG
             if refineFrames == 0 { adaptiveVideoBitrate = AdaptiveVideoBitrate(ceiling: baseBitrate) }
             #else

@@ -1,5 +1,26 @@
 import XCTest
 
+final class AdaptiveVideoBitratePreferenceTests: XCTestCase {
+    func testNewInstallationDefaultsOnWithoutWritingAPreference() throws {
+        let suite = "AdaptiveBitratePreferenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        XCTAssertTrue(AdaptiveVideoBitratePreference.isEnabled(in: defaults))
+        XCTAssertNil(defaults.persistentDomain(forName: suite)?[AdaptiveVideoBitratePreference.disabledKey])
+    }
+
+    func testUserChoiceSurvivesReopeningDefaultsAndCanBeReenabled() throws {
+        let suite = "AdaptiveBitratePreferenceTests.\(UUID().uuidString)"
+        let defaults = try XCTUnwrap(UserDefaults(suiteName: suite))
+        defer { defaults.removePersistentDomain(forName: suite) }
+        AdaptiveVideoBitratePreference.save(enabled: false, in: defaults)
+        let reopened = try XCTUnwrap(UserDefaults(suiteName: suite))
+        XCTAssertFalse(AdaptiveVideoBitratePreference.isEnabled(in: reopened))
+        AdaptiveVideoBitratePreference.save(enabled: true, in: reopened)
+        XCTAssertTrue(AdaptiveVideoBitratePreference.isEnabled(in: defaults))
+    }
+}
+
 final class AdaptiveVideoBitrateTests: XCTestCase {
     private func feedback(_ now: Double, mbps: Double = 18, rtt: Double = 6,
                           video: Double = 18, p95: Double = 25) -> AdaptiveVideoBitrate.Feedback {

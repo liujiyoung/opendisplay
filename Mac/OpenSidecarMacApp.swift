@@ -226,6 +226,12 @@ final class SenderController: ObservableObject {
     @Published var quality = StreamQuality(rawValue: UserDefaults.standard.string(forKey: "quality") ?? "") ?? .best {
         didSet { UserDefaults.standard.set(quality.rawValue, forKey: "quality") }
     }
+    @Published var adaptiveBitrateEnabled = AdaptiveVideoBitratePreference.isEnabled() {
+        didSet {
+            AdaptiveVideoBitratePreference.save(enabled: adaptiveBitrateEnabled)
+            sessions.forEach { $0.sender.setAdaptiveBitrateEnabled(adaptiveBitrateEnabled) }
+        }
+    }
 
     var running: Bool { !sessions.isEmpty }
 
@@ -674,7 +680,8 @@ final class SenderController: ObservableObject {
 
         let name = label(for: target)
         let sender = MacSender(transport: transport, name: name, mode: mode,
-                               quality: quality, displaySerial: Self.displaySerial(for: id),
+                               quality: quality, adaptiveBitrateEnabled: adaptiveBitrateEnabled,
+                               displaySerial: Self.displaySerial(for: id),
                                identityOffset: identityOffset(for: id),
                                awaitingWake: awaitingWake)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
@@ -1042,6 +1049,15 @@ struct ContentView: View {
                     }
                     .onChange(of: controller.quality) { controller.restartAll() }
                     Text(controller.quality.explanation)
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Adaptive bitrate (Wi-Fi)", isOn: $controller.adaptiveBitrateEnabled)
+                        .toggleStyle(.switch)
+                        .accessibilityIdentifier("adaptiveBitrateToggle")
+                    Text("Automatically adjusts video quality on Wi-Fi. USB always uses a fixed bitrate.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

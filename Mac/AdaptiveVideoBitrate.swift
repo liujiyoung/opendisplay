@@ -1,5 +1,18 @@
 import Foundation
 
+enum AdaptiveVideoBitratePreference {
+    // Preserve the existing command-line override and default-on behavior.
+    static let disabledKey = "disableAdaptiveBitrate"
+
+    static func isEnabled(in defaults: UserDefaults = .standard) -> Bool {
+        !defaults.bool(forKey: disabledKey)
+    }
+
+    static func save(enabled: Bool, in defaults: UserDefaults = .standard) {
+        defaults.set(!enabled, forKey: disabledKey)
+    }
+}
+
 /// Feedback controller for the video byte budget, independent of raster/fps.
 /// A slow control RTT alone is not evidence that video bitrate is excessive.
 struct AdaptiveVideoBitrate {
