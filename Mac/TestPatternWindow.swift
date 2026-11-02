@@ -71,11 +71,22 @@ private final class PatternWindow: NSWindow {
 }
 
 private struct PatternView: View {
+    private let stress = UserDefaults.standard.bool(forKey: "testPatternStress")
     var body: some View {
         TimelineView(.animation) { context in
             Canvas { g, size in
                 let t = context.date.timeIntervalSinceReferenceDate
                 g.fill(Path(CGRect(origin: .zero, size: size)), with: .color(.white))
+                if stress {
+                    let phase = t * 2
+                    let index = Int(phase) % StressTexture.frames.count
+                    let rect = CGRect(origin: .zero, size: size)
+                    g.draw(Image(decorative: StressTexture.frames[index], scale: 1).interpolation(.none), in: rect)
+                    var blend = g
+                    blend.opacity = phase - floor(phase)
+                    blend.draw(Image(decorative: StressTexture.frames[(index + 1) % StressTexture.frames.count], scale: 1).interpolation(.none), in: rect)
+                    g.fill(Path(CGRect(x: 0, y: 0, width: size.width, height: 110)), with: .color(.white))
+                }
                 // Bouncing block — guarantees per-frame pixel changes.
                 let x = (sin(t * 1.7) * 0.5 + 0.5) * (size.width - 140)
                 let y = (cos(t * 2.3) * 0.5 + 0.5) * (size.height - 240) + 100
@@ -87,5 +98,26 @@ private struct PatternView: View {
                        at: CGPoint(x: size.width / 2, y: 60))
             }
         }
+    }
+}
+
+/// Precomputed textures keep test rendering cheap and reproducible. Both A/B
+/// runs use the same eight-frame cycle, without fetching any media or traffic.
+private enum StressTexture {
+    static let frames: [CGImage] = (0..<8).map { index in
+        let width = 128, height = 96
+        var seed = UInt64(index + 1)
+        var pixels = [UInt8](repeating: 255, count: width * height * 4)
+        for offset in stride(from: 0, to: pixels.count, by: 4) {
+            for channel in 0..<3 {
+                seed = seed &* 6_364_136_223_846_793_005 &+ 1
+                pixels[offset + channel] = 72 + UInt8((seed >> 32) & 127)
+            }
+        }
+        let provider = CGDataProvider(data: Data(pixels) as CFData)!
+        return CGImage(width: width, height: height, bitsPerComponent: 8, bitsPerPixel: 32,
+                       bytesPerRow: width * 4, space: CGColorSpaceCreateDeviceRGB(),
+                       bitmapInfo: CGBitmapInfo(rawValue: CGImageAlphaInfo.noneSkipLast.rawValue),
+                       provider: provider, decode: nil, shouldInterpolate: false, intent: .defaultIntent)!
     }
 }

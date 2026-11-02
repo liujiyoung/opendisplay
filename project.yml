@@ -162,6 +162,7 @@ targets:
       - Mac/DisplayArrangement.swift
       - Mac/OriginRestore.swift
       - Mac/StreamConfiguration.swift
+      - Mac/AdaptiveVideoBitrate.swift
       - Mac/VirtualCanvasSizing.swift
       - Mac/PhoneInfo.swift
       - Mac/DesktopPolicy.swift

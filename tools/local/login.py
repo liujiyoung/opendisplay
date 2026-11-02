@@ -14,6 +14,10 @@ parser.add_argument('--test-pattern', action='store_true',
                     help='Show the same animated workload for latency comparisons.')
 parser.add_argument('--disable-independent-control', action='store_true',
                     help='Use the legacy control path for same-build latency comparisons.')
+parser.add_argument('--stress-pattern', action='store_true',
+                    help='Use deterministic dense video for bitrate comparisons.')
+parser.add_argument('--disable-adaptive-bitrate', action='store_true',
+                    help='Use the fixed preset bitrate for same-build comparisons.')
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[2]
 local_label = 'com.peetzweg.opensidecar.headless'
@@ -42,10 +46,14 @@ config = {
     'StandardOutPath': str(logs / 'launchd.stdout.log'),
     'StandardErrorPath': str(logs / 'launchd.stderr.log'),
 }
-if args.test_pattern:
+if args.test_pattern or args.stress_pattern:
     config['ProgramArguments'] += ['-testPattern', 'YES']
+if args.stress_pattern:
+    config['ProgramArguments'] += ['-testPatternStress', 'YES']
 if args.disable_independent_control:
     config['ProgramArguments'] += ['-disableIndependentControl', 'YES']
+if args.disable_adaptive_bitrate:
+    config['ProgramArguments'] += ['-disableAdaptiveBitrate', 'YES']
 if args.action == 'preview':
     dest = root / '.local/headless-launchagent.plist'
     dest.parent.mkdir(parents=True, exist_ok=True)

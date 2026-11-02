@@ -22,6 +22,9 @@ def summarize(rows):
         raise ValueError('Control channel changed during measurement; repeat the run')
     if any(r.get('senderControlChannel', r.get('controlChannel', 'video')) != r.get('controlChannel', 'video') for r in rows):
         raise ValueError('Sender/receiver control channels disagree')
+    for key in ('workload', 'videoConfiguration', 'bitrateMode'):
+        if len({r.get(key, 'legacy') for r in rows}) != 1:
+            raise ValueError(f'{key} changed during measurement; repeat the run')
 
     def stats(values):
         if not values or not all(math.isfinite(x) and x >= 0 for x in values):
@@ -38,7 +41,7 @@ def summarize(rows):
     paths = [x for r in rows for x in r['cursorPaths']]
     if len(samples) != len(paths):
         raise ValueError('Cursor sample/path counts do not match')
-    return {
+    result = {
         'transport': 'WiFi', 'quality': rows[0]['quality'],
         'control_channel': rows[0].get('controlChannel', 'video'),
         'windows': len(rows), 'seconds': sum(r['seconds'] for r in rows),
@@ -50,6 +53,17 @@ def summarize(rows):
         'expired_probes': sum(r['expired'] for r in rows),
         'stalled_windows': sum(r['seconds'] > 7 for r in rows),
     }
+    if all('videoBitrate' in r for r in rows):
+        targets = [r['videoBitrate'] for r in rows]
+        durations = [r['videoPayloadSeconds'] for r in rows]
+        if any(x <= 0 for x in targets + durations):
+            raise ValueError('Invalid video bitrate measurement')
+        result.update(
+            workload=rows[0]['workload'], video_configuration=rows[0]['videoConfiguration'],
+            bitrate_mode=rows[0]['bitrateMode'], video_target_min=min(targets), video_target_max=max(targets),
+            encoder_frame_protected_windows=sum(bool(r.get('encoderFrameProtection')) for r in rows),
+            video_submission_mbps=sum(r['videoPayloadBytes'] for r in rows) * 8 / sum(durations) / 1_000_000)
+    return result
 
 
 def main():

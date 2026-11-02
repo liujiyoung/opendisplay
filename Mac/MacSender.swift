@@ -124,8 +124,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // ── Outstanding send backpressure (maxPendingSends = 3) ──────────────────
     //
     // pendingSends counts video frames whose NWConnection.send completion has
-    // not fired yet — i.e. bytes still in flight / waiting on TCP ACKs. Allow a
-    // small pipeline (3) so the link is not idle between ACKs; unlike the encoder,
+    // not fired yet — local transport processing, not remote TCP ACKs. Allow a
+    // small pipeline (3) so the link is not idle between sends; unlike the encoder,
     // a few outstanding sends helps throughput without piling up seconds of lag.
     //
     // When pendingSends hits the cap we skip the capture before encode (net
@@ -134,6 +134,22 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // bottleneck fired. Never encode-then-discard: dropping here avoids wasting
     // VT work on frames that would only add latency.
     private var pendingSends = 0
+    private var pendingVideoSendTimes: [UInt64: Double] = [:]
+    private var videoSendID: UInt64 = 0
+    private var adaptiveVideoBitrate: AdaptiveVideoBitrate?
+    private var videoFeedback: AdaptiveVideoBitrate.Feedback?
+    private var appliedVideoBitrate = 0
+    private var adaptiveTickAt = ProcessInfo.processInfo.systemUptime
+    private var adaptiveOfferedBytes = 0
+    private var adaptiveLastNetDrops = 0
+    private var videoPayloadBytes = 0
+    private var videoPayloadReportAt = ProcessInfo.processInfo.systemUptime
+    private var encoderRateDrops = 0
+    private var encoderOutputFrames = 0
+    private var adaptiveLastRateDrops = 0
+    private var adaptiveLastOutputs = 0
+    private var adaptiveFrameProtected = false
+    private var adaptiveSafeBitrate = 0
     private let maxPendingSends = 3
     private let pipelineLock = NSLock()
     private var dropsEncThisWindow = 0
@@ -1359,6 +1375,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // capture starts so a new receiver sees it before the first video frame.
         queue.async { [weak self] in
             guard self?.activeStreamConfigurationSnapshot == chosen else { return }
+            self?.resetAdaptiveVideoBitrate()
             self?.sendStreamConfiguration(chosen)
         }
 
@@ -1467,6 +1484,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.closeControlChannel()
             self.stopUpgradeProbing()
             self.pendingSends = 0
+            self.pendingVideoSendTimes.removeAll()
             self.pipelineLock.lock()
             self.pendingEncodes = 0
             self.pipelineLock.unlock()
@@ -1712,6 +1730,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         Log.info("connection ready to \(endpointName)")
         closeControlChannel()
         connectionGeneration &+= 1
+        pendingSends = 0
+        pendingVideoSendTimes.removeAll()
         let readyGeneration = connectionGeneration
         // Per-session; the receiver rewound its floor with the connection.
         // Keep both cursor-side resets on the cursor queue so reconnects do
@@ -1770,6 +1790,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             Log.info("connection path to \(endpointName): \(names) wired=\(wired) direct=\(currentPathDirectLink)")
             Task { @MainActor in self.onTransportPath?(wired) }
         }
+        resetAdaptiveVideoBitrate()
         // -forceUpgradeProbe YES: dev knob — loopback runs never look like
         // WiFi, so this is the only way to exercise probe+migrate on one Mac.
         if currentPathUsesWiFi || UserDefaults.standard.bool(forKey: "forceUpgradeProbe") {
@@ -2163,6 +2184,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         closeCursorChannel()   // rebuilt from the next hello
         closeControlChannel()
         pendingSends = 0
+        pendingVideoSendTimes.removeAll()
         pipelineLock.lock()
         pendingEncodes = 0
         pipelineLock.unlock()
@@ -2183,6 +2205,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, !self.stopped else { return }
             if self.connectionReady {
+                self.updateAdaptiveVideoBitrate()
                 // Liveness + send-side health for the phone's overlay.
                 let elapsed = Date().timeIntervalSince(self.capWindowStart)
                 let capFps = elapsed > 0 ? Int(Double(self.capFrames) / elapsed) : 0
@@ -2605,6 +2628,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             var report = obj
             report["quality"] = quality.rawValue
             report["senderControlChannel"] = controlChannelActive ? "dedicated" : "video"
+            let reportAt = ProcessInfo.processInfo.systemUptime
+            report["bitrateMode"] = adaptiveVideoBitrate == nil ? "fixed" : "adaptive"
+            report["encoderFrameProtection"] = adaptiveFrameProtected
+            report["videoBitrate"] = appliedVideoBitrate
+            report["videoBitrateCeiling"] = baseBitrate
+            report["videoPayloadBytes"] = videoPayloadBytes
+            report["videoPayloadSeconds"] = reportAt - videoPayloadReportAt
+            report["workload"] = UserDefaults.standard.bool(forKey: "testPattern")
+                ? (UserDefaults.standard.bool(forKey: "testPatternStress") ? "dense-smooth" : "simple") : "desktop"
+            if let config = activeStreamConfigurationSnapshot {
+                report["videoConfiguration"] = "\(config.codec):\(config.encodedSize.width)x\(config.encodedSize.height):\(config.framesPerSecond)"
+            }
+            videoPayloadBytes = 0
+            videoPayloadReportAt = reportAt
             cursorNetworkLock.lock()
             report["udpConfirmed"] = cursorChannelConfirmed
             cursorNetworkLock.unlock()
@@ -2620,6 +2657,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 sendJSONFrame("{\"type\":\"pong\",\"t\":\(t),\"mt\":\(mt)}")
             }
         case "stats":
+            let feedback = AdaptiveVideoBitrate.Feedback(
+                receivedAt: ProcessInfo.processInfo.systemUptime,
+                mbps: obj["mbps"] as? Double ?? 0, rttMs: obj["rtt"] as? Double ?? 0,
+                videoP50Ms: obj["e2e50"] as? Double ?? 0, videoP95Ms: obj["e2e95"] as? Double ?? 0,
+                encodeMs: obj["enc50"] as? Double ?? 0, decodeMs: obj["dec50"] as? Double ?? 0)
+            if feedback.isValid { videoFeedback = feedback }
             // Aggregated pipeline health measured on the phone — logged here
             // so one file holds both ends of the story.
             if let json = try? JSONSerialization.data(withJSONObject: obj),
@@ -2894,6 +2937,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_ExpectedFrameRate,
                              value: configuration.framesPerSecond as CFNumber)
         VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_PrioritizeEncodingSpeedOverQuality, value: kCFBooleanTrue)
+        if case .tcp = transport {
+            // Permit quantization to absorb a smaller network budget before
+            // the low-latency encoder sacrifices cadence. Optional on AMD.
+            let qpStatus = VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_MaxAllowedFrameQP, value: 51 as CFNumber)
+            if qpStatus != noErr { Log.info("encoder max-QP control unavailable: \(qpStatus)") }
+        }
         let prepareStatus = VTCompressionSessionPrepareToEncodeFrames(encoder)
         if prepareStatus != noErr, configuration.codec == VideoStreamConfiguration.hevcCodec {
             VTCompressionSessionInvalidate(encoder)
@@ -2908,6 +2957,91 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     // MARK: - Capture callback
+
+    private func resetAdaptiveVideoBitrate() {
+        guard baseBitrate > 0, encoder != nil else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        adaptiveVideoBitrate = nil
+        if case .tcp = transport, !currentPathDirectLink,
+           !UserDefaults.standard.bool(forKey: "disableAdaptiveBitrate") {
+            #if DEBUG
+            if refineFrames == 0 { adaptiveVideoBitrate = AdaptiveVideoBitrate(ceiling: baseBitrate) }
+            #else
+            adaptiveVideoBitrate = AdaptiveVideoBitrate(ceiling: baseBitrate)
+            #endif
+        }
+        videoFeedback = nil
+        adaptiveTickAt = now
+        adaptiveOfferedBytes = 0
+        adaptiveLastNetDrops = dropsNetTotal
+        videoPayloadBytes = 0
+        videoPayloadReportAt = now
+        adaptiveFrameProtected = false
+        adaptiveSafeBitrate = baseBitrate
+        pipelineLock.lock()
+        adaptiveLastRateDrops = encoderRateDrops
+        adaptiveLastOutputs = encoderOutputFrames
+        pipelineLock.unlock()
+        if !applyVideoBitrate(baseBitrate) { adaptiveVideoBitrate = nil }
+        Log.info("video bitrate mode: \(adaptiveVideoBitrate == nil ? "fixed" : "adaptive") ceiling=\(baseBitrate)")
+    }
+
+    private func updateAdaptiveVideoBitrate() {
+        let now = ProcessInfo.processInfo.systemUptime
+        let elapsed = now - adaptiveTickAt
+        guard elapsed > 0 else { return }
+        let offered = Double(adaptiveOfferedBytes) * 8 / elapsed / 1_000_000
+        let dropped = max(0, dropsNetTotal - adaptiveLastNetDrops)
+        adaptiveTickAt = now
+        adaptiveOfferedBytes = 0
+        adaptiveLastNetDrops = dropsNetTotal
+        pipelineLock.lock()
+        let rateDrops = max(0, encoderRateDrops - adaptiveLastRateDrops)
+        let outputs = max(0, encoderOutputFrames - adaptiveLastOutputs)
+        adaptiveLastRateDrops = encoderRateDrops
+        adaptiveLastOutputs = encoderOutputFrames
+        pipelineLock.unlock()
+        if adaptiveVideoBitrate != nil, rateDrops + outputs >= 15,
+           rateDrops * 5 < rateDrops + outputs {
+            adaptiveSafeBitrate = min(adaptiveSafeBitrate, appliedVideoBitrate)
+        }
+        if adaptiveVideoBitrate != nil, appliedVideoBitrate < baseBitrate,
+           rateDrops + outputs >= 15, rateDrops * 5 >= rateDrops + outputs {
+            // Codec rate control, not a slow network, is discarding cadence.
+            // Restore the last budget that maintained cadence. If that floor
+            // itself became unsafe after a content change, move one step up.
+            let safe = min(baseBitrate, adaptiveSafeBitrate > appliedVideoBitrate
+                ? adaptiveSafeBitrate : (appliedVideoBitrate * 4 + 2) / 3)
+            adaptiveSafeBitrate = safe
+            adaptiveVideoBitrate = AdaptiveVideoBitrate(ceiling: baseBitrate, minimum: safe, initial: safe)
+            adaptiveFrameProtected = true
+            if applyVideoBitrate(safe) {
+                Log.info("adaptive bitrate frame protection: restored \(safe), rateDrops=\(rateDrops) outputs=\(outputs)")
+            } else {
+                adaptiveVideoBitrate = nil
+                Log.info("adaptive bitrate frame protection: encoder rejected restore; retaining last applied budget")
+            }
+            return
+        }
+        let oldest = pendingVideoSendTimes.values.min().map { max(0, now - $0) * 1000 } ?? 0
+        guard let decision = adaptiveVideoBitrate?.update(now: now, offeredMbps: offered,
+            pending: pendingSends, oldestSendMs: oldest, networkDrops: dropped, feedback: videoFeedback) else { return }
+        if applyVideoBitrate(decision.bitrate) {
+            Log.info("adaptive bitrate: \(decision.bitrate) reason=\(decision.reason) offeredMbps=\(String(format: "%.2f", offered)) pending=\(pendingSends)")
+        } else {
+            adaptiveVideoBitrate = nil
+            Log.info("adaptive bitrate disabled: encoder rejected live bitrate update")
+        }
+    }
+
+    @discardableResult
+    private func applyVideoBitrate(_ bitrate: Int) -> Bool {
+        guard let encoder, bitrate > 0 else { return false }
+        let status = VTSessionSetProperty(encoder, key: kVTCompressionPropertyKey_AverageBitRate, value: bitrate as CFNumber)
+        guard status == noErr else { Log.info("video bitrate update failed: \(status)"); return false }
+        appliedVideoBitrate = bitrate
+        return true
+    }
 
     func stream(_ stream: SCStream,
                 didOutputSampleBuffer sampleBuffer: CMSampleBuffer,
@@ -3125,12 +3259,18 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             duration: .invalid,
             frameProperties: frameProperties,
             infoFlagsOut: nil
-        ) { [weak self] status, _, buffer in
+        ) { [weak self] status, flags, buffer in
             guard let self else { return }
             var deliveryEnqueued = false
             defer {
                 if !deliveryEnqueued { self.finishPendingEncode() }
             }
+            let rateDropped = status == noErr && buffer == nil
+            self.pipelineLock.lock()
+            if rateDropped { self.encoderRateDrops += 1 }
+            else if status == noErr, buffer != nil { self.encoderOutputFrames += 1 }
+            self.pipelineLock.unlock()
+            if rateDropped, flags.contains(.frameDropped) { return }
             self.noteEncodeResult(succeeded: status == noErr && buffer != nil)
             guard status == noErr, let buffer else {
                 // A session rejecting every frame looks healthy in all other
@@ -3429,9 +3569,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         var frame = Data(bytes: &header, count: 4)
         frame.append(payload)
         pendingSends += 1
+        videoSendID &+= 1
+        let sendID = videoSendID
+        let generation = connectionGeneration
+        pendingVideoSendTimes[sendID] = ProcessInfo.processInfo.systemUptime
+        adaptiveOfferedBytes += frame.count
+        videoPayloadBytes += frame.count
         connection.send(content: frame, completion: .contentProcessed { [weak self] error in
-            guard let self else { return }
+            guard let self, self.connection === connection,
+                  self.connectionGeneration == generation else { return }
             self.pendingSends -= 1
+            self.pendingVideoSendTimes.removeValue(forKey: sendID)
             if let error {
                 Log.info("send error: \(error)")
                 return

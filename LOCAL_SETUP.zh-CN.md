@@ -14,7 +14,7 @@
 - 从 SSH 等应用返回前台时重新绑定触控板，核对当前场景的实际指针锁状态；触控板输入配置变更或临时丢锁时尝试恢复。诊断日志中的 `pointer input` 仅记录原始/已转发事件数量和捕获状态，不记录按键文字或屏幕内容。
 - Mac 可通过用户级 LaunchAgent 在登录后自动启动、保持单实例，并在退出后重启。
 
-已在 M4 Mac mini 与 11 英寸 M1 iPad Pro / 苹果妙控键盘上验证画面、键盘、触控板和输入法。USB 使用 2388×1668 HEVC，流内统计通常约 60 fps；该统计不是完整输入到光子的硬件延迟测量。162 项 Mac 测试及 2 项 iPad UIKit 回归测试覆盖跨屏坐标、拖动后的双击状态、视频布局、硬件键盘输入、Caps Lock 单次触发和修饰键过滤，以及控制通道的分帧、顺序屏障与真实 TCP 消息顺序。
+已在 M4 Mac mini 与 11 英寸 M1 iPad Pro / 苹果妙控键盘上验证画面、键盘、触控板和输入法。USB 使用 2388×1668 HEVC，流内统计通常约 60 fps；该统计不是完整输入到光子的硬件延迟测量。171 项 Mac 测试及 2 项 iPad UIKit 回归测试覆盖跨屏坐标、拖动后的双击状态、视频布局、硬件键盘输入、Caps Lock 单次触发和修饰键过滤，以及控制通道的分帧、顺序屏障与真实 TCP 消息顺序。
 
 已实测：拔掉 Mac 外接显示器后，可仅用 iPad 经 Wi-Fi 显示和控制；在此无显示器状态下，Wi-Fi → USB → Wi-Fi 自动切换正常。无外接显示器时正常退出发送端，LaunchAgent 能自动拉起应用、创建虚拟显示器并重连 Wi-Fi。以上是已登录图形会话内的测试，不能替代冷启动验收。
 
@@ -44,6 +44,10 @@ Mac → USB-C 数据线 → **iPad 机身 USB-C 口**。妙控键盘通过 Smart
 OpenDisplay 的接收设备连接及有线链路探测显式使用局域网直连，避免系统 SOCKS/HTTP 代理接管设备流量或把代理回环误判为有线链路。此设置仅作用于应用的设备连接，不修改系统代理或 GitHub 的 Git 代理配置。
 
 无线连接支持按会话绑定的独立可靠控制通道：默认视频 TCP 9000、光标 UDP 9001、键鼠与心跳 TCP 9002（自定义基准端口时分别为基准、+1、+2）。控制通道使用独立网络队列、关闭 Nagle，并绕过局域网代理；UDP 不可用时，光标也可经独立 TCP 返回。切换前等待旧通道输入顺序屏障，按键和鼠标按钮不跨连接乱序。独立通道在启用前失败时保留原通道；启用后失效则释放远端按键并重连，不重放可能已执行的点击。失败后冷却 30 秒再允许新尝试，避免反复中断无头桌面。旧版本和 USB 使用原有可靠通道。可在 Mac 启动参数追加 `-disableIndependentControl YES` 做同版本对照；此开关默认关闭，日常连接自动协商。
+
+局域网 TCP 视频连接默认启用自适应码率，Best / Balanced / Fast 的上限分别为 18 / 10 / 6 Mbps，初始下限为上限的 25% 且不低于 2 Mbps。分辨率和目标帧率保持原档位；拥塞时会降低画面细节。每两秒检查本地发送积压与不超过八秒的接收端反馈，有压力时降低目标 25%；稳定十二秒后，每隔至少五秒增加档位上限的 5%（至少 0.25 Mbps）。低流量桌面不会只因控制 RTT 尖峰降码率，过期反馈也不会触发向上恢复。
+
+编码器若在至少十五次回调中主动丢掉 20% 以上的帧，策略会恢复上一档保持出帧的安全码率，并提高本连接的码率下限；内容变复杂时可继续提高安全下限。这样避免以持续大幅降帧换取较低平均延迟。新连接或编码器重建时重新评估；USB 恢复原档位固定码率。使用 VideoToolbox 的平均码率目标，不附加硬字节上限；可用 `-disableAdaptiveBitrate YES` 关闭自动调整。量化控制与码率属性采用公开接口，见 [Apple 的低延迟编码说明](https://developer.apple.com/videos/play/wwdc2021/10158/)。
 
 ## 构建
 
@@ -165,6 +169,38 @@ Mac mini 与 M1 iPad Pro 在同一局域 Wi-Fi 下，保持 Best、HEVC、2388×
 **结果：独立通道功能生效，但本轮未测出稳定的平均延迟改善。** 首轮变慢后保留原始结果，使用同一安装包关闭再开启做相邻对照；该对照均值接近，P95 降低，仍不足以证明总体卡顿已修复。它隔离了控制与视频的 TCP 字节流及网络队列，无法消除共享 Wi-Fi 的空口竞争，输入注入仍在原有串行队列上保持顺序。尚未做强制丢包或通道故障的实机验收；测试覆盖分帧、缓冲上限和真实 TCP 连续消息顺序。后续自适应码率应单独采样和验收。
 
 本机原始记录为 `build/Measurements/step2-before-control.json`、`step2-after-control.json`、`step2-control-off-adjacent.json`、`step2-control-on-adjacent.json`。同版本关闭对照可用 `python3 tools/local/login.py install --test-pattern --disable-independent-control`，恢复普通启动用 `python3 tools/local/login.py install`。
+
+### 自适应码率验证（2026-11-02）
+
+正式有效对照使用同一安装包、同一连续渐变纹理、独立 TCP 控制和 UDP 光标，保持原 Wi-Fi、位置、Best、HEVC、2388×1668、目标 60 fps。关闭和开启自适应各采集约 61.4 秒。该负载与前两步不同，只比较本步同条件两轮。
+
+| 指标 | 固定码率 | 自适应码率 |
+| --- | ---: | ---: |
+| 光标应用层往返算术均值 | 28.24 ms | 27.06 ms |
+| 光标往返 P95 | 94.26 ms | 96.09 ms |
+| 普通应用 RTT 算术均值（各 31 个样本） | 36.06 ms | 21.24 ms |
+| 有效光标样本（全部 UDP） | 307 | 307 |
+| 探针超时 | 0 | 0 |
+| 本地提交视频码流 | 17.26 Mbps | 4.96 Mbps |
+| 采样窗口记录的码率目标 | 18 Mbps | 4.50–6.60 Mbps |
+| 接收 FPS 快照中位数 | 58 | 60 |
+| 接收 FPS 快照范围 | 52–60 | 37–60 |
+
+视频提交码流下降约 71%，光标均值本轮下降约 4.2%，但 P95 未改善；不能据此宣称无线卡顿已解决。FPS 是测量时段内接收端每五秒报告的单秒快照（两轮分别 12、11 个），不是全时段平均帧率；开启轮仍有短时 37 fps 快照。视频码流用本地提交的视频帧字节数除以对应时间，不含链路开销，不代表运营商出口流量。
+
+早期不连续随机纹理在低码率下只有 7–18 fps，判为失败并加入编码器实际丢帧保护；该纹理之后会触发保护恢复高码率，无法作为有效降码率对照。上述数据均保留，未混入最终连续负载的结果。极难压缩的内容可能提升安全码率下限；不能只降低目标值而忽略实际出帧。
+
+有效原始记录为本机 `build/Measurements/step3-smooth-before-adaptive.json`、`step3-smooth-after-adaptive.json`，FPS 快照与时间戳在 `step3-video-observations.json`；早期数据保留在同目录的 `step3-before/after-adaptive`、`step3-v2-*`、`step3-final-*` 文件。可用以下命令复测，完成后恢复普通桌面：
+
+```sh
+python3 tools/local/login.py install --stress-pattern --disable-adaptive-bitrate
+python3 tools/local/latency.py --label adaptive-off --warmup 15 --windows 12
+python3 tools/local/login.py install --stress-pattern
+python3 tools/local/latency.py --label adaptive-on --warmup 15 --windows 12
+python3 tools/local/login.py install
+```
+
+171 项 Mac 回归测试和 6 项测量脚本测试通过；iPad 接收端沿用第二步版本。仍需以实际手机热点、随身 Wi-Fi 的信道和空口情况验收尾延迟。
 
 ## 无头启动的边界
 
