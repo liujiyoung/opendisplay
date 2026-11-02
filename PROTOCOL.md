@@ -765,6 +765,28 @@ sessions rotate the token and discard pending input, and callbacks from
 retired sockets are ignored. Tokens bind sessions; they are unencrypted
 and do not provide device pairing or protection against network sniffing.
 
+### 6.9 Remote Caps Lock (`welcome.capsLockKey`)
+
+The optional integer `capsLockKey: 1` in `welcome` tells an updated receiver
+to send physical Caps Lock as ordinary `key` frames with HID usage 57:
+one down/up pair per physical press, suppressing key repeat. Input remains
+ordered on the current reliable control path. The sender decides the action
+from its saved UI preference; changing that preference needs no reconnect.
+
+The default is letter case. The sender maintains a remote case latch,
+independent of iPadOS input-source settings. It suppresses incoming AlphaShift
+and applies letter case without emitting a native Caps Lock event/flag that
+could trigger macOS input-source switching. Number/punctuation keys and
+Control/Command/Option shortcuts retain their modifiers. Enabling the optional
+input-source mode clears the case latch and emits Control-Space once per press.
+`inputReset` and transport migration release the press latch while retaining
+case; a new sender session starts unlocked.
+
+A receiver connecting to a sender without `capsLockKey` retains the earlier
+Control-Space fallback. Earlier receivers that already converted Caps Lock to
+Control-Space need updating to use the sender's new choice: their shortcut is
+indistinguishable from an intentional Control-Space chord.
+
 ## 7. Coordinate spaces and units
 
 The most common third-party bug is a unit mismatch, so here is every space

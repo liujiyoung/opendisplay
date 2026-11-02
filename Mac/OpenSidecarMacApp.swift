@@ -232,6 +232,12 @@ final class SenderController: ObservableObject {
             sessions.forEach { $0.sender.setAdaptiveBitrateEnabled(adaptiveBitrateEnabled) }
         }
     }
+    @Published var capsLockSwitchesInputSource = CapsLockInputSourcePreference.isEnabled() {
+        didSet {
+            CapsLockInputSourcePreference.save(enabled: capsLockSwitchesInputSource)
+            sessions.forEach { $0.sender.setCapsLockSwitchesInputSource(capsLockSwitchesInputSource) }
+        }
+    }
 
     var running: Bool { !sessions.isEmpty }
 
@@ -681,6 +687,7 @@ final class SenderController: ObservableObject {
         let name = label(for: target)
         let sender = MacSender(transport: transport, name: name, mode: mode,
                                quality: quality, adaptiveBitrateEnabled: adaptiveBitrateEnabled,
+                               capsLockSwitchesInputSource: capsLockSwitchesInputSource,
                                displaySerial: Self.displaySerial(for: id),
                                identityOffset: identityOffset(for: id),
                                awaitingWake: awaitingWake)
@@ -1058,6 +1065,15 @@ struct ContentView: View {
                         .toggleStyle(.switch)
                         .accessibilityIdentifier("adaptiveBitrateToggle")
                     Text("Automatically adjusts video quality on Wi-Fi. USB always uses a fixed bitrate.")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                VStack(alignment: .leading, spacing: 4) {
+                    Toggle("Caps Lock switches input source", isOn: $controller.capsLockSwitchesInputSource)
+                        .toggleStyle(.switch)
+                        .accessibilityIdentifier("capsLockInputSourceToggle")
+                    Text("Off: Caps Lock controls letter case. On: switch between input sources.")
                         .font(.caption)
                         .foregroundStyle(.secondary)
                 }

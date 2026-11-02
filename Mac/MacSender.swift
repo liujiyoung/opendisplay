@@ -89,6 +89,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private let mode: CaptureMode
     private let quality: StreamQuality
     private var adaptiveBitrateEnabled: Bool
+    private var remoteCapsLock: RemoteCapsLockState
     // Stable per-device serial for the virtual display, so macOS can tell
     // multiple OpenDisplay monitors apart and persist their arrangement.
     private let displaySerial: UInt32
@@ -384,6 +385,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     init(transport: SenderTransport, name: String, mode: CaptureMode,
          quality: StreamQuality = .best,
          adaptiveBitrateEnabled: Bool = AdaptiveVideoBitratePreference.isEnabled(),
+         capsLockSwitchesInputSource: Bool = CapsLockInputSourcePreference.isEnabled(),
          displaySerial: UInt32 = 0x0001,
          identityOffset: UInt32 = 0, awaitingWake: Bool = false) {
         self.transport = transport
@@ -391,6 +393,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         self.mode = mode
         self.quality = quality
         self.adaptiveBitrateEnabled = adaptiveBitrateEnabled
+        self.remoteCapsLock = RemoteCapsLockState(switchesInputSource: capsLockSwitchesInputSource)
         self.displaySerial = displaySerial
         self.baseIdentityOffset = identityOffset
         self.awaitingWake = awaitingWake
@@ -1733,6 +1736,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func becomeReady(_ conn: NWConnection) {
         Log.info("connection ready to \(endpointName)")
         closeControlChannel()
+        remoteCapsLock.releaseKey()
         connectionGeneration &+= 1
         pendingSends = 0
         pendingVideoSendTimes.removeAll()
@@ -2734,8 +2738,19 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         case "key":
             if let hid = obj["hid"] as? Int, let down = obj["down"] as? Bool {
-                inputInjector?.handleKey(hid: hid, down: down,
-                                         modifiers: (obj["modifiers"] as? UInt64) ?? 0)
+                if hid == 57 {
+                    switch remoteCapsLock.update(down: down) {
+                    case .switchInputSource:
+                        inputInjector?.switchInputSource()
+                        Log.info("remote Caps Lock: input-source switch")
+                    case .caseChanged:
+                        Log.info("remote Caps Lock: letter case \(remoteCapsLock.isLocked ? "upper" : "lower")")
+                    case .none: break
+                    }
+                } else {
+                    inputInjector?.handleKey(hid: hid, down: down,
+                        modifiers: remoteCapsLock.keyboardModifiers(hid: hid, flags: (obj["modifiers"] as? UInt64) ?? 0))
+                }
             }
         case "text":
             if let text = obj["text"] as? String { inputInjector?.handleText(text) }
@@ -2744,7 +2759,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
                 inputInjector?.handleRelativePointer(phase: phase, dx: dx, dy: dy,
                     button: obj["button"] as? Int ?? 0, clicks: obj["clicks"] as? Int ?? 1,
-                    modifiers: obj["modifiers"] as? UInt64 ?? 0)
+                    modifiers: remoteCapsLock.modifiers(obj["modifiers"] as? UInt64 ?? 0))
             }
         case "pointerScroll":
             if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
@@ -2755,9 +2770,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                let x = obj["x"] as? Double, let y = obj["y"] as? Double {
                 inputInjector?.handlePointer(phase: phase, x: x, y: y,
                     button: obj["button"] as? Int ?? 0, clicks: obj["clicks"] as? Int ?? 1,
-                    modifiers: obj["modifiers"] as? UInt64 ?? 0)
+                    modifiers: remoteCapsLock.modifiers(obj["modifiers"] as? UInt64 ?? 0))
             }
         case "inputReset":
+            remoteCapsLock.releaseKey()
             inputInjector?.releaseRemoteInput()
         case "touch":
             if let phase = obj["phase"] as? String,
@@ -2961,6 +2977,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     // MARK: - Capture callback
+
+    func setCapsLockSwitchesInputSource(_ enabled: Bool) {
+        queue.async { [weak self] in
+            guard let self, !self.stopped else { return }
+            self.remoteCapsLock.setSwitchesInputSource(enabled)
+            Log.info("Caps Lock mode: \(enabled ? "input-source" : "letter-case")")
+        }
+    }
 
     func setAdaptiveBitrateEnabled(_ enabled: Bool) {
         queue.async { [weak self] in
@@ -3490,7 +3514,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Identify ourselves to the receiver: our protocol version and the oldest
     /// receiver version we still support.
     private func sendWelcome() {
-        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"remoteInput\":\(RemoteInput.relativePointerCapability),\"latencyProbes\":1}")
+        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"remoteInput\":\(RemoteInput.relativePointerCapability),\"capsLockKey\":\(RemoteInput.capsLockKeyCapability),\"latencyProbes\":1}")
     }
 
     /// Announce the operating point before video. Legacy receivers ignore the

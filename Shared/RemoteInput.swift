@@ -5,10 +5,11 @@ import Foundation
 enum RemoteInput {
     static let capability = 1
     static let relativePointerCapability = 2
+    static let capsLockKeyCapability = 1
     static let modifierMask: UInt64 = 0x00BF0000 // caps, shift, control, option, command, keypad, fn
 
-    /// The iPad's Caps Lock is an input-source switch, so its local latch must
-    /// never make subsequently forwarded letters or pointer events uppercase.
+    /// The Mac owns Caps Lock behavior; the iPad's local latch must not leak
+    /// into the independently tracked remote case or input-source mode.
     static func iPadModifiers(_ flags: UInt64) -> UInt64 {
         flags & modifierMask & ~(1 << 16)
     }
@@ -58,4 +59,49 @@ struct InputSourceSwitchKey {
     }
 
     mutating func reset() { held = false }
+}
+
+/// Remote Caps Lock is independent of the iPad's own input-source settings.
+/// The sender chooses its action without renegotiating or reconnecting.
+struct RemoteCapsLockState {
+    enum Action: Equatable { case none, caseChanged, switchInputSource }
+    private var key = InputSourceSwitchKey()
+    private(set) var switchesInputSource: Bool
+    private(set) var isLocked = false
+
+    init(switchesInputSource: Bool = false) {
+        self.switchesInputSource = switchesInputSource
+    }
+
+    mutating func setSwitchesInputSource(_ enabled: Bool) {
+        guard switchesInputSource != enabled else { return }
+        switchesInputSource = enabled
+        isLocked = false
+        key.reset()
+    }
+
+    mutating func update(down: Bool) -> Action {
+        guard key.update(down: down) else { return .none }
+        if switchesInputSource { return .switchInputSource }
+        isLocked.toggle()
+        return .caseChanged
+    }
+
+    mutating func releaseKey() { key.reset() }
+
+    func modifiers(_ flags: UInt64) -> UInt64 {
+        RemoteInput.iPadModifiers(flags)
+    }
+
+    func keyboardModifiers(hid: Int, flags: UInt64) -> UInt64 {
+        var result = modifiers(flags)
+        let shortcutModifiers: UInt64 = (1 << 18) | (1 << 19) | (1 << 20)
+        if isLocked, !switchesInputSource, (4...29).contains(hid), result & shortcutModifiers == 0 {
+            // AlphaShift itself can trigger macOS's Caps-to-input-source
+            // behavior. Apply case to letters with Shift instead, without
+            // changing punctuation or turning Cmd+C into Cmd+Shift+C.
+            result ^= 1 << 17
+        }
+        return result
+    }
 }

@@ -79,6 +79,7 @@ final class StreamReceiver: ObservableObject {
     @Published private(set) var supportsRemoteInput = false
     @Published private(set) var supportsRelativePointer = false
     private(set) var remoteModifiers: UInt64 = 0
+    @Published private(set) var supportsCapsLockKey = false
 
     /// True when the connected Mac understands pencil/proximity wire messages.
     var macSupportsPencilWire: Bool { macProtocolVersion >= WireProtocol.pencilWireVersion }
@@ -834,6 +835,7 @@ final class StreamReceiver: ObservableObject {
         DispatchQueue.main.async {
             self.cursorState = (0.5, 0.5, false)
             self.cursorSprite = nil
+            self.supportsCapsLockKey = false
             self.onCursor?(0.5, 0.5, false)
         }
         let onReady: () -> Void = { [weak self] in
@@ -1025,11 +1027,13 @@ final class StreamReceiver: ObservableObject {
             // old Mac can't diagnose that itself, so we surface it here.
             let macPV = obj["pv"] as? Int ?? WireProtocol.assumedWhenAbsent
             let remoteInput = obj["remoteInput"] as? Int ?? 0
+            let capsLockKey = obj["capsLockKey"] as? Int ?? 0
             supportsLatencyProbes = (obj["latencyProbes"] as? Int ?? 0) >= 1
             DispatchQueue.main.async {
                 self.macProtocolVersion = macPV
                 self.supportsRemoteInput = remoteInput >= RemoteInput.capability
                 self.supportsRelativePointer = remoteInput >= RemoteInput.relativePointerCapability
+                self.supportsCapsLockKey = capsLockKey >= RemoteInput.capsLockKeyCapability
             }
             if macPV < WireProtocol.minSupportedPeer {
                 let msg = "OpenDisplay on the connecting computer is too old for this \(deviceKind) app. Update it there to reconnect."
@@ -1271,6 +1275,17 @@ final class StreamReceiver: ObservableObject {
     func sendText(_ text: String) {
         guard supportsRemoteInput, !text.isEmpty else { return }
         sendControl(["type": "text", "text": text])
+    }
+
+    func sendCapsLockPress() {
+        if supportsCapsLockKey {
+            let modifiers = remoteModifiers
+            sendKey(hid: 57, down: true, modifiers: modifiers)
+            sendKey(hid: 57, down: false, modifiers: modifiers)
+        } else {
+            // Older Mac builds only support the previous iPad-side remap.
+            sendShortcut(hid: 44, modifierHID: 224)
+        }
     }
 
     /// Some system shortcuts are reserved by iPadOS; the toolbar can send
@@ -1859,6 +1874,7 @@ final class StreamReceiver: ObservableObject {
                 self.macProtocolVersion = WireProtocol.assumedWhenAbsent
                 self.supportsRemoteInput = false
                 self.supportsRelativePointer = false
+                self.supportsCapsLockKey = false
                 self.remoteModifiers = 0
             }
         }

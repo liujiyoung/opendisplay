@@ -61,6 +61,15 @@ final class InputInjector {
         }
     }
 
+    func switchInputSource() {
+        let controlHeld = heldKeys.contains(59) || heldKeys.contains(62)
+        let control: UInt64 = 1 << 18
+        if !controlHeld { handleKey(hid: 224, down: true, modifiers: control) }
+        handleKey(hid: 44, down: true, modifiers: control)
+        handleKey(hid: 44, down: false, modifiers: control)
+        if !controlHeld { handleKey(hid: 224, down: false, modifiers: 0) }
+    }
+
     func handlePointer(phase: String, x: Double, y: Double, button: Int,
                        clicks: Int, modifiers: UInt64) {
         guard x.isFinite, y.isFinite, (0...2).contains(button) else { return }

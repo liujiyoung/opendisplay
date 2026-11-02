@@ -139,7 +139,7 @@ final class RemoteKeyboardView: UIView, UITextViewDelegate {
         rawCapsLock?.pressedChangedHandler = { [weak self] _, _, down in
             DispatchQueue.main.async { self?.capsLockChanged(down: down) }
         }
-        Log.info("Caps Lock input-source key: \(rawCapsLock == nil ? "UIKit" : "raw keyboard")")
+        Log.info("Caps Lock key capture: \(rawCapsLock == nil ? "UIKit" : "raw keyboard")")
     }
 
     private func capsLockChanged(down: Bool) {
@@ -150,8 +150,8 @@ final class RemoteKeyboardView: UIView, UITextViewDelegate {
             return
         }
         guard inputSourceSwitchKey.update(down: down) else { return }
-        receiver?.sendShortcut(hid: 44, modifierHID: 224) // Control-Space on the Mac
-        Log.info("Caps Lock: requested Mac input-source switch")
+        receiver?.sendCapsLockPress()
+        Log.info("Caps Lock: forwarded key press to Mac")
     }
 
     private func tapKey(_ hid: Int) {
