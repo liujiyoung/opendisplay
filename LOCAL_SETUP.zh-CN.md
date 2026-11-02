@@ -6,12 +6,13 @@
 
 - 硬件键盘通过 HID 键位映射转发给 Mac，由 Mac 当前输入法处理输入。
 - 触控板支持悬停、单击、右键、拖动、双击和连续滚动。
+- 全屏接收时捕获触控板相对移动，按 Mac 显示器排列在 iPad 与外接显示器之间移动光标、按住拖动；支持位于主屏左侧或上方的显示器。打开工具条、设置或 iPad 文本输入时释放捕获，关闭后恢复。
 - 工具条默认完全隐藏；三指轻点 **iPad 屏幕** 显示或收起。展开后位于右上方，也可点 × 关闭，避免遮住 Dock。
 - 工具条提供 Esc、Tab、Mac 快捷键菜单，以及可选的 iPad 文本输入模式。部分组合键由 iPadOS 保留，可从 Mac 菜单发送切换输入法、切换应用、复制和粘贴。
 - 断线、应用进入后台或输入焦点离开时释放远端按键和鼠标按钮。
 - Mac 可通过用户级 LaunchAgent 在登录后自动启动、保持单实例，并在退出后重启。
 
-已在 M4 Mac mini 与 11 英寸 M1 iPad Pro / 苹果妙控键盘上验证画面、键盘、触控板和输入法。USB 使用 2388×1668 HEVC，流内统计通常约 60 fps；该统计不是完整输入到光子的硬件延迟测量。144 项 Mac 单元测试及 2 项 iPad UIKit 回归测试通过。
+已在 M4 Mac mini 与 11 英寸 M1 iPad Pro / 苹果妙控键盘上验证画面、键盘、触控板和输入法。USB 使用 2388×1668 HEVC，流内统计通常约 60 fps；该统计不是完整输入到光子的硬件延迟测量。149 项 Mac 单元测试及 2 项 iPad UIKit 回归测试覆盖跨屏坐标、拖动后的双击状态、视频布局和硬件键盘输入。
 
 **冷启动、FileVault 预启动解锁、普通锁屏恢复及所有布局/快捷键组合尚未全部验收。** 自动启动项在用户登录后运行，不能替代登录前的画面和解锁步骤。
 
@@ -24,6 +25,7 @@ Mac → USB-C 数据线 → **iPad 机身 USB-C 口**。妙控键盘通过 Smart
 3. 根据系统提示重新打开应用。屏幕录制负责采集桌面，辅助功能负责注入输入。
 4. 默认用 Extend、Best。Extend 是另一块桌面，已有窗口需拖到 iPad；需要相同画面时选 Mirror。显示大小使用设备行旁的箭头按钮调整。
 5. 若双指右键无效，检查 iPadOS 触控板的辅助点按设置。
+6. 同时连接外接显示器时，在 Mac 的 **系统设置 → 显示器 → 排列** 中确认两块屏幕的位置，再沿相邻边缘移动。iPad 保持全屏且工具条关闭，才能持续捕获触控板；三指轻点 iPad 屏幕可释放捕获并打开工具条。
 
 正常使用时保持 iPad 应用在前台。断线后重插数据线，发送端会重连。主动点击 Disconnect 会记住断开选择，需要手动 Connect 恢复。
 
@@ -108,13 +110,15 @@ Apple 文档说明：Apple 芯片 Mac 在 macOS 26 及以上、开启 Remote Log
 
 ## 协议扩展
 
-沿用上游协议 3 对未知字段和类型的忽略规则，不改变视频和 USB 传输。Mac 在 welcome 中增加 `remoteInput: 1`，iPad 仅在收到该能力后发送：
+沿用上游协议 3 对未知字段和类型的忽略规则，不改变视频和 USB 传输。Mac 在 welcome 中增加 `remoteInput: 2`。能力 1 支持基础输入，能力 2 另支持跨屏相对指针；接收端仅在收到对应能力后发送：
 
 | type | 数据 |
 | --- | --- |
 | key | HID usage、down、modifiers |
 | text | 已提交的 Unicode 文本 |
 | pointer | phase=down/move/up、归一化 x/y、button=0/1/2、clicks、modifiers |
+| pointerRelative | 能力 2；phase=down/move/up、dx/dy（Mac 全局桌面点，向右/向下为正）、button、clicks、modifiers |
+| pointerScroll | 能力 2；dx/dy 滚动量，在 Mac 当前光标位置派发，不把光标移回 iPad |
 | inputReset | 释放会话持有的按键和鼠标按钮 |
 
 修饰键仅允许 caps、shift、control、option、command、keypad、fn。原有 touch、scroll、pencil 路径保持兼容。完整新增输入功能需要配套使用本分支的 Mac 和 iPad 应用。

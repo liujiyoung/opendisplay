@@ -171,6 +171,7 @@ targets:
       - Mac/LogPolicies.swift
       - Shared/Protocol.swift
       - Shared/RemoteInput.swift
+      - Shared/DesktopPointer.swift
       - Shared/DirectCable.swift
       - Shared/LogSnapshot.swift
       - MacReceiver/FullscreenPreference.swift
@@ -203,6 +204,13 @@ targets:
         CFBundleShortVersionString: "$(MARKETING_VERSION)"
         CFBundleVersion: "$(CURRENT_PROJECT_VERSION)"
         UILaunchScreen: {}
+        UIApplicationSceneManifest:
+          UIApplicationSupportsMultipleScenes: true
+          UISceneConfigurations:
+            UIWindowSceneSessionRoleApplication:
+              - UISceneConfigurationName: OpenDisplay
+                UISceneClassName: UIWindowScene
+                UISceneDelegateClassName: $(PRODUCT_MODULE_NAME).ReceiverSceneDelegate
         # Full screen on iPadOS 26 and earlier, as before. From iOS 27 the
         # app follows its window instead (an iPhone Duo's Split View, iPadOS
         # 27 multitasking); the receiver reports whatever window it gets.

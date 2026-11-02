@@ -2579,6 +2579,17 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         case "text":
             if let text = obj["text"] as? String { inputInjector?.handleText(text) }
+        case "pointerRelative":
+            if let phase = obj["phase"] as? String,
+               let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
+                inputInjector?.handleRelativePointer(phase: phase, dx: dx, dy: dy,
+                    button: obj["button"] as? Int ?? 0, clicks: obj["clicks"] as? Int ?? 1,
+                    modifiers: obj["modifiers"] as? UInt64 ?? 0)
+            }
+        case "pointerScroll":
+            if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
+                inputInjector?.handlePointerScroll(dx: dx, dy: dy)
+            }
         case "pointer":
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double, let y = obj["y"] as? Double {
@@ -3214,7 +3225,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Identify ourselves to the receiver: our protocol version and the oldest
     /// receiver version we still support.
     private func sendWelcome() {
-        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"remoteInput\":\(RemoteInput.capability)}")
+        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"remoteInput\":\(RemoteInput.relativePointerCapability)}")
     }
 
     /// Announce the operating point before video. Legacy receivers ignore the

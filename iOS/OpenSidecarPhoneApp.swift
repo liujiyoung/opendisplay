@@ -11,11 +11,41 @@ let deviceKind = UIDevice.current.userInterfaceIdiom == .pad ? "iPad" : "iPhone"
 let macAppURL = URL(string: "https://opendisplay.app/")!
 
 @main
-struct OpenSidecarPhoneApp: App {
-    var body: some Scene {
-        WindowGroup {
-            ReceiverScreen()
+final class OpenSidecarPhoneApp: UIResponder, UIApplicationDelegate {
+    private var replacingLegacyScene = false
+
+    func application(_ application: UIApplication,
+                     didFinishLaunchingWithOptions options: [UIApplication.LaunchOptionsKey: Any]?) -> Bool {
+        Log.info("receiver application started")
+        // An in-place upgrade can retain SwiftUI's old scene configuration.
+        // Retire only that obsolete receiver window; application data stays intact.
+        let legacy = application.openSessions.filter { $0.configuration.name != "OpenDisplay" }
+        Log.info("receiver scene sessions: \(application.openSessions.map { $0.configuration.name ?? "unnamed" })")
+        replacingLegacyScene = !legacy.isEmpty
+        for session in legacy {
+            application.requestSceneSessionDestruction(session, options: nil) { error in
+                Log.info("legacy receiver scene removal failed: \(error)")
+            }
         }
+        return true
+    }
+
+    func application(_ application: UIApplication, didDiscardSceneSessions sceneSessions: Set<UISceneSession>) {
+        guard replacingLegacyScene else { return }
+        replacingLegacyScene = false
+        application.requestSceneSessionActivation(nil, userActivity: nil, options: nil) { error in
+            Log.info("receiver scene activation failed: \(error)")
+        }
+    }
+
+    func application(_ application: UIApplication,
+                     configurationForConnecting session: UISceneSession,
+                     options: UIScene.ConnectionOptions) -> UISceneConfiguration {
+        let configuration = UISceneConfiguration(name: "OpenDisplay", sessionRole: session.role)
+        configuration.sceneClass = UIWindowScene.self
+        configuration.delegateClass = ReceiverSceneDelegate.self
+        Log.info("configuring receiver window scene")
+        return configuration
     }
 }
 
@@ -37,6 +67,7 @@ extension UIWindow {
 // MARK: - Root screen
 
 struct ReceiverScreen: View {
+    @ObservedObject var pointerCapture: RelativePointerCapture
     @StateObject private var model = ReceiverModel()
     @StateObject private var versionGate = VersionGate()
     @State private var showSettings = false
@@ -44,7 +75,6 @@ struct ReceiverScreen: View {
     @State private var nagDismissed = false
     @State private var showSoftwareKeyboard = false
     @State private var showRemoteTools = false
-    @Environment(\.scenePhase) private var scenePhase
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
     // First-run onboarding (issue #49): explain the Mac app is required.
@@ -55,6 +85,12 @@ struct ReceiverScreen: View {
     // Streaming = connected and the video format is known.
     private var isStreaming: Bool {
         model.receiver.connected && model.receiver.videoSize != .zero
+    }
+
+    private var shouldCapturePointer: Bool {
+        isStreaming && model.receiver.supportsRelativePointer
+            && !showRemoteTools && !showSettings && !showSoftwareKeyboard
+            && UIApplication.shared.applicationState == .active
     }
 
     // Below the force floor → present the blocking gate (issue #135). The
@@ -81,6 +117,7 @@ struct ReceiverScreen: View {
                                    receiver: model.receiver,
                                    useMetal: metalRenderer,
                                    softwareKeyboard: showSoftwareKeyboard,
+                                   pointerCapture: pointerCapture,
                                    onToggleTools: {
                                        withAnimation(.easeInOut(duration: 0.15)) {
                                            showRemoteTools.toggle()
@@ -188,14 +225,17 @@ struct ReceiverScreen: View {
         .onReceive(NotificationCenter.default.publisher(for: .deviceDidShake)) { _ in
             showSettings = true
         }
-        .onChange(of: scenePhase) { phase in
-            if phase != .active { model.receiver.resetRemoteInput() }
-            Log.info("scenePhase -> \(String(describing: phase))")
-            switch phase {
-            case .active: model.sceneDidActivate()
-            case .background: model.sceneDidBackground()
-            default: break
-            }
+        .onChange(of: shouldCapturePointer) { pointerCapture.enabled = $0 }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didBecomeActiveNotification)) { _ in
+            model.sceneDidActivate()
+            pointerCapture.enabled = shouldCapturePointer
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+            model.receiver.resetRemoteInput()
+            pointerCapture.enabled = false
+        }
+        .onReceive(NotificationCenter.default.publisher(for: UIApplication.didEnterBackgroundNotification)) { _ in
+            model.sceneDidBackground()
         }
         // The deliberate "screen off" signal: locking the device makes
         // protected data unavailable (a plain app switch doesn't). This is
@@ -229,7 +269,9 @@ struct ReceiverScreen: View {
         }
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
+            pointerCapture.receiver = model.receiver
             model.start()
+            pointerCapture.enabled = shouldCapturePointer
             // Show the first-run hint unless the device has connected before
             // or the user already dismissed it.
             if !hasConnectedBefore && !onboardingDismissed {
@@ -839,6 +881,7 @@ struct VideoLayerView: UIViewRepresentable {
     let receiver: StreamReceiver
     let useMetal: Bool
     let softwareKeyboard: Bool
+    let pointerCapture: RelativePointerCapture
     let onToggleTools: () -> Void
 
     func makeUIView(context: Context) -> VideoView {
@@ -847,6 +890,7 @@ struct VideoLayerView: UIViewRepresentable {
         view.clipsToBounds = true   // a held frame can be larger than a folded screen
         view.isMultipleTouchEnabled = true
         view.receiver = receiver
+        view.pointerCapture = pointerCapture
         view.onToggleTools = onToggleTools
         view.keyboardInput.receiver = receiver
         view.addSubview(view.keyboardInput)
@@ -894,7 +938,7 @@ struct VideoLayerView: UIViewRepresentable {
         let hover = UIHoverGestureRecognizer(target: view, action: #selector(VideoView.pointerHover(_:)))
         hover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
         view.addGestureRecognizer(hover)
-        let scroll = UIPanGestureRecognizer(target: view, action: #selector(VideoView.didTwoFingerPan(_:)))
+        let scroll = UIPanGestureRecognizer(target: view, action: #selector(VideoView.didPointerScroll(_:)))
         scroll.allowedTouchTypes = []
         scroll.allowedScrollTypesMask = .all
         view.addGestureRecognizer(scroll)
@@ -922,11 +966,13 @@ struct VideoLayerView: UIViewRepresentable {
         // videoSize arrives after the format description — re-fit the layers.
         uiView.setNeedsLayout()
         uiView.onToggleTools = onToggleTools
+        uiView.pointerCapture = pointerCapture
         uiView.keyboardInput.setSoftwareKeyboard(softwareKeyboard)
     }
 
     final class VideoView: UIView {
         weak var receiver: StreamReceiver?
+        weak var pointerCapture: RelativePointerCapture?
         var metalRenderer: MetalVideoRenderer?
         var videoLayer: AVSampleBufferDisplayLayer?
         let inputEngine = InputCaptureEngine()
@@ -946,6 +992,7 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         @objc func pointerHover(_ recognizer: UIHoverGestureRecognizer) {
+            guard pointerCapture?.isCapturing != true else { return }
             guard recognizer.state == .began || recognizer.state == .changed,
                   let p = normalized(recognizer.location(in: self)) else { return }
             receiver?.sendPointer(phase: "move", x: p.x, y: p.y,
@@ -953,6 +1000,7 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         private func sendPointer(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?) {
+            guard pointerCapture?.isCapturing != true else { return }
             guard let touch = touches.first(where: { $0.type == .indirectPointer }),
                   let p = normalized(touch.location(in: self)) else { return }
             if phase == "began" {
@@ -1151,6 +1199,23 @@ struct VideoLayerView: UIViewRepresentable {
         private var twoFingerActive = false
         private var lastPan = CGPoint.zero
         private var lastNorm: (x: Double, y: Double) = (0.5, 0.5)
+        private var lastPointerScroll = CGPoint.zero
+
+        @objc func didPointerScroll(_ recognizer: UIPanGestureRecognizer) {
+            guard pointerCapture?.isCapturing == true else {
+                didTwoFingerPan(recognizer)
+                return
+            }
+            switch recognizer.state {
+            case .began: lastPointerScroll = .zero
+            case .changed:
+                let translation = recognizer.translation(in: self)
+                receiver?.sendPointerScroll(dx: translation.x - lastPointerScroll.x,
+                                             dy: translation.y - lastPointerScroll.y)
+                lastPointerScroll = translation
+            default: lastPointerScroll = .zero
+            }
+        }
 
         @objc func didTwoFingerPan(_ recognizer: UIPanGestureRecognizer) {
             guard let video = receiver?.videoSize, video != .zero else { return }

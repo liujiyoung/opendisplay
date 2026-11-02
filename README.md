@@ -1,8 +1,8 @@
 # iPad Magic Keyboard / Headless Mac Fork
 
-This fork adds iPad hardware keyboard and trackpad forwarding, an optional native text input mode, hidden-by-default controls, and a post-login Mac sender launcher. Use matching Mac and iPad builds from this fork for the added input features.
+This fork adds iPad hardware keyboard and trackpad forwarding, an optional native text input mode, hidden-by-default controls, and a post-login Mac sender launcher. With matching builds, the full-screen iPad captures relative trackpad input so the Mac cursor and held drags can cross between the iPad and other connected displays, following the Mac's display arrangement.
 
-Three-finger tap the **iPad screen** to show or hide controls. The compact controls appear at the top right, leaving the Mac Dock unobstructed.
+Three-finger tap the **iPad screen** to show or hide controls. Opening controls releases pointer capture; hiding them resumes capture. The compact controls appear at the top right, leaving the Mac Dock unobstructed.
 
 [中文构建与使用说明](LOCAL_SETUP.zh-CN.md) · Based on upstream commit `4e7c1f11597aeede1d62b7f38c2f556331b800d3` · GPL-3.0, original attribution retained.
 

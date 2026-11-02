@@ -77,6 +77,8 @@ final class StreamReceiver: ObservableObject {
     /// Mac protocol version from the most recent `welcome` message.
     @Published private(set) var macProtocolVersion = WireProtocol.assumedWhenAbsent
     @Published private(set) var supportsRemoteInput = false
+    @Published private(set) var supportsRelativePointer = false
+    private(set) var remoteModifiers: UInt64 = 0
 
     /// True when the connected Mac understands pencil/proximity wire messages.
     var macSupportsPencilWire: Bool { macProtocolVersion >= WireProtocol.pencilWireVersion }
@@ -850,6 +852,7 @@ final class StreamReceiver: ObservableObject {
             DispatchQueue.main.async {
                 self.macProtocolVersion = macPV
                 self.supportsRemoteInput = remoteInput >= RemoteInput.capability
+                self.supportsRelativePointer = remoteInput >= RemoteInput.relativePointerCapability
             }
             if macPV < WireProtocol.minSupportedPeer {
                 let msg = "OpenDisplay on the connecting computer is too old for this \(deviceKind) app. Update it there to reconnect."
@@ -1066,6 +1069,7 @@ final class StreamReceiver: ObservableObject {
 
     func sendKey(hid: Int, down: Bool, modifiers: UInt64 = 0) {
         guard supportsRemoteInput else { return }
+        remoteModifiers = modifiers & RemoteInput.modifierMask
         sendControl(["type": "key", "hid": hid, "down": down,
                      "modifiers": modifiers & RemoteInput.modifierMask])
     }
@@ -1100,8 +1104,21 @@ final class StreamReceiver: ObservableObject {
     }
 
     func resetRemoteInput() {
+        remoteModifiers = 0
         guard supportsRemoteInput else { return }
         sendControl(["type": "inputReset"])
+    }
+
+    func sendRelativePointer(phase: String, dx: Double = 0, dy: Double = 0,
+                             button: Int = 0, clicks: Int = 1) {
+        guard supportsRelativePointer else { return }
+        sendControl(["type": "pointerRelative", "phase": phase, "dx": dx, "dy": dy,
+                     "button": button, "clicks": clicks, "modifiers": remoteModifiers])
+    }
+
+    func sendPointerScroll(dx: Double, dy: Double) {
+        guard supportsRelativePointer else { return }
+        sendControl(["type": "pointerScroll", "dx": dx, "dy": dy])
     }
 
     /// Two-finger scroll: dx/dy in video pixels (natural-scrolling sign).
@@ -1620,6 +1637,8 @@ final class StreamReceiver: ObservableObject {
             if !value {
                 self.macProtocolVersion = WireProtocol.assumedWhenAbsent
                 self.supportsRemoteInput = false
+                self.supportsRelativePointer = false
+                self.remoteModifiers = 0
             }
         }
         if !value { setStatus("Ready to connect") }

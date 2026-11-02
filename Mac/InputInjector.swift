@@ -65,6 +65,29 @@ final class InputInjector {
                        clicks: Int, modifiers: UInt64) {
         guard x.isFinite, y.isFinite, (0...2).contains(button) else { return }
         let p = screenPoint(nx: min(max(x, 0), 1), ny: min(max(y, 0), 1))
+        postPointer(phase: phase, at: p, button: button, clicks: clicks, modifiers: modifiers)
+    }
+
+    func handleRelativePointer(phase: String, dx: Double, dy: Double, button: Int,
+                               clicks: Int, modifiers: UInt64) {
+        guard (0...2).contains(button) else { return }
+        let origin = currentCursor()
+        guard let point = DesktopPointer.moved(from: origin, dx: dx, dy: dy,
+                                               displays: activeDisplayBounds()) else { return }
+        postPointer(phase: phase, at: point, button: button, clicks: clicks, modifiers: modifiers)
+    }
+
+    private func activeDisplayBounds() -> [CGRect] {
+        var count: UInt32 = 0
+        guard CGGetActiveDisplayList(0, nil, &count) == .success, count > 0 else { return [] }
+        var ids = [CGDirectDisplayID](repeating: 0, count: Int(count))
+        guard CGGetActiveDisplayList(count, &ids, &count) == .success else { return [] }
+        return ids.prefix(Int(count)).map { CGDisplayBounds($0) }
+    }
+
+    private func postPointer(phase: String, at p: CGPoint, button: Int,
+                             clicks: Int, modifiers: UInt64) {
+        let origin = currentCursor()
         let effectiveButton = phase == "move" ? (heldPointerButtons.sorted().first ?? button) : button
         let mouseButton: CGMouseButton = effectiveButton == 1 ? .right : effectiveButton == 2 ? .center : .left
         let type: CGEventType
@@ -85,6 +108,18 @@ final class InputInjector {
                                   mouseCursorPosition: p, mouseButton: mouseButton) else { return }
         event.flags = CGEventFlags(rawValue: modifiers & RemoteInput.modifierMask)
         event.setIntegerValueField(.mouseEventClickState, value: Int64(min(max(clicks, 1), 3)))
+        event.setIntegerValueField(.mouseEventDeltaX, value: Int64((p.x - origin.x).rounded()))
+        event.setIntegerValueField(.mouseEventDeltaY, value: Int64((p.y - origin.y).rounded()))
+        event.post(tap: .cghidEventTap)
+    }
+
+    /// Pointer scrolling follows the cursor on whichever display currently owns it.
+    func handlePointerScroll(dx: Double, dy: Double) {
+        guard dx.isFinite, dy.isFinite, abs(dx) <= 4096, abs(dy) <= 4096,
+              let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
+                                  wheel1: Int32(dy.rounded()), wheel2: Int32(dx.rounded()), wheel3: 0)
+        else { return }
+        event.location = currentCursor()
         event.post(tap: .cghidEventTap)
     }
 
@@ -99,11 +134,7 @@ final class InputInjector {
         }
         heldKeys.removeAll()
         for button in Array(heldPointerButtons) {
-            let b = CGDisplayBounds(displayID)
-            let p = CGEvent(source: nil)?.location ?? b.origin
-            handlePointer(phase: "up", x: b.width > 0 ? (p.x - b.minX) / b.width : 0,
-                          y: b.height > 0 ? (p.y - b.minY) / b.height : 0,
-                          button: button, clicks: 1, modifiers: 0)
+            postPointer(phase: "up", at: currentCursor(), button: button, clicks: 1, modifiers: 0)
         }
     }
     // Synthetic OpenDisplay tablet — conspicuous in logs; not Wacom (0x056A) or

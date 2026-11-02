@@ -4,6 +4,7 @@ import Foundation
 /// UIKit HID usages are physical keys; macOS CGKeyCode is a different table.
 enum RemoteInput {
     static let capability = 1
+    static let relativePointerCapability = 2
     static let modifierMask: UInt64 = 0x00BF0000 // caps, shift, control, option, command, keypad, fn
 
     static func macKeyCode(forHID usage: Int) -> UInt16? { keyCodes[usage] }
