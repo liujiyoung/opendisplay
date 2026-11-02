@@ -76,6 +76,7 @@ final class StreamReceiver: ObservableObject {
     @Published var peerSignal: PeerUpdateSignal?
     /// Mac protocol version from the most recent `welcome` message.
     @Published private(set) var macProtocolVersion = WireProtocol.assumedWhenAbsent
+    @Published private(set) var supportsRemoteInput = false
 
     /// True when the connected Mac understands pencil/proximity wire messages.
     var macSupportsPencilWire: Bool { macProtocolVersion >= WireProtocol.pencilWireVersion }
@@ -845,8 +846,10 @@ final class StreamReceiver: ObservableObject {
             // older than we support, it's the Mac that needs updating — and an
             // old Mac can't diagnose that itself, so we surface it here.
             let macPV = obj["pv"] as? Int ?? WireProtocol.assumedWhenAbsent
+            let remoteInput = obj["remoteInput"] as? Int ?? 0
             DispatchQueue.main.async {
                 self.macProtocolVersion = macPV
+                self.supportsRemoteInput = remoteInput >= RemoteInput.capability
             }
             if macPV < WireProtocol.minSupportedPeer {
                 let msg = "OpenDisplay on the connecting computer is too old for this \(deviceKind) app. Update it there to reconnect."
@@ -1059,6 +1062,46 @@ final class StreamReceiver: ObservableObject {
         var msg: [String: Any] = ["type": "touch", "phase": phase, "x": x, "y": y]
         if let offset = clockOffsetMs { msg["t"] = nowMs + offset }
         sendControl(msg)
+    }
+
+    func sendKey(hid: Int, down: Bool, modifiers: UInt64 = 0) {
+        guard supportsRemoteInput else { return }
+        sendControl(["type": "key", "hid": hid, "down": down,
+                     "modifiers": modifiers & RemoteInput.modifierMask])
+    }
+
+    func sendText(_ text: String) {
+        guard supportsRemoteInput, !text.isEmpty else { return }
+        sendControl(["type": "text", "text": text])
+    }
+
+    /// Some system shortcuts are reserved by iPadOS; the toolbar can send
+    /// their Mac equivalent explicitly without changing iPad settings.
+    func sendShortcut(hid: Int, modifierHID: Int) {
+        let flag: UInt64
+        switch modifierHID {
+        case 224: flag = 1 << 18 // Control
+        case 225: flag = 1 << 17 // Shift
+        case 226: flag = 1 << 19 // Option
+        case 227: flag = 1 << 20 // Command
+        default: return
+        }
+        sendKey(hid: modifierHID, down: true, modifiers: flag)
+        sendKey(hid: hid, down: true, modifiers: flag)
+        sendKey(hid: hid, down: false, modifiers: flag)
+        sendKey(hid: modifierHID, down: false)
+    }
+
+    func sendPointer(phase: String, x: Double, y: Double, button: Int = 0,
+                     clicks: Int = 1, modifiers: UInt64 = 0) {
+        guard supportsRemoteInput else { return }
+        sendControl(["type": "pointer", "phase": phase, "x": x, "y": y,
+                     "button": button, "clicks": clicks, "modifiers": modifiers & RemoteInput.modifierMask])
+    }
+
+    func resetRemoteInput() {
+        guard supportsRemoteInput else { return }
+        sendControl(["type": "inputReset"])
     }
 
     /// Two-finger scroll: dx/dy in video pixels (natural-scrolling sign).
@@ -1576,6 +1619,7 @@ final class StreamReceiver: ObservableObject {
             self.connected = value
             if !value {
                 self.macProtocolVersion = WireProtocol.assumedWhenAbsent
+                self.supportsRemoteInput = false
             }
         }
         if !value { setStatus("Ready to connect") }

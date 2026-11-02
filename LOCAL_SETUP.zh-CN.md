@@ -1,0 +1,120 @@
+# iPad Pro + 妙控键盘，作为 Mac 的显示与输入终端
+
+此分支基于 [peetzweg/opendisplay](https://github.com/peetzweg/opendisplay) 的提交 `4e7c1f11597aeede1d62b7f38c2f556331b800d3`（1.30.1），增加 iPad 妙控键盘与触控板输入、可隐藏工具条，以及登录后的 Mac 自动启动。保留上游 GPL-3.0 许可证和作者归属。
+
+## 功能与验证范围
+
+- 硬件键盘通过 HID 键位映射转发给 Mac，由 Mac 当前输入法处理输入。
+- 触控板支持悬停、单击、右键、拖动、双击和连续滚动。
+- 工具条默认完全隐藏；三指轻点 **iPad 屏幕** 显示或收起。展开后位于右上方，也可点 × 关闭，避免遮住 Dock。
+- 工具条提供 Esc、Tab、Mac 快捷键菜单，以及可选的 iPad 文本输入模式。部分组合键由 iPadOS 保留，可从 Mac 菜单发送切换输入法、切换应用、复制和粘贴。
+- 断线、应用进入后台或输入焦点离开时释放远端按键和鼠标按钮。
+- Mac 可通过用户级 LaunchAgent 在登录后自动启动、保持单实例，并在退出后重启。
+
+已在 M4 Mac mini 与 11 英寸 M1 iPad Pro / 苹果妙控键盘上验证画面、键盘、触控板和输入法。USB 使用 2388×1668 HEVC，流内统计通常约 60 fps；该统计不是完整输入到光子的硬件延迟测量。144 项 Mac 单元测试及 2 项 iPad UIKit 回归测试通过。
+
+**冷启动、FileVault 预启动解锁、普通锁屏恢复及所有布局/快捷键组合尚未全部验收。** 自动启动项在用户登录后运行，不能替代登录前的画面和解锁步骤。
+
+## 连接方式
+
+Mac → USB-C 数据线 → **iPad 机身 USB-C 口**。妙控键盘通过 Smart Connector 连接 iPad；键盘转轴上的 USB-C 口仅供充电，不能传数据。
+
+1. iPad 解锁，确认信任 Mac，并在前台打开接收应用。
+2. Mac 打开 **OpenDisplay Dev**，在 Permissions 区域请求屏幕录制和辅助功能权限，再在系统设置中开启对应开关。
+3. 根据系统提示重新打开应用。屏幕录制负责采集桌面，辅助功能负责注入输入。
+4. 默认用 Extend、Best。Extend 是另一块桌面，已有窗口需拖到 iPad；需要相同画面时选 Mirror。显示大小使用设备行旁的箭头按钮调整。
+5. 若双指右键无效，检查 iPadOS 触控板的辅助点按设置。
+
+正常使用时保持 iPad 应用在前台。断线后重插数据线，发送端会重连。主动点击 Disconnect 会记住断开选择，需要手动 Connect 恢复。
+
+## 构建
+
+需要 macOS 14+、Xcode 15+ 和 XcodeGen；具体可用 SDK 要能编译当前上游源码。iPad 实机安装还需要自己的 Apple 开发签名、配对设备和开发者模式。
+
+```sh
+brew install xcodegen
+cp .env.example .env
+```
+
+编辑 `.env`，填入自己的团队号和唯一的 iOS bundle ID：
+
+```dotenv
+DEVELOPMENT_TEAM=YOURTEAMID
+IOS_BUNDLE_IDENTIFIER=com.example.opendisplay.ios.dev
+LAUNCH_AGENT_LABEL=com.peetzweg.opensidecar.headless
+```
+
+`.env`、构建产物、签名文件和本地依赖不应提交。示例 bundle ID 需要换成自己可签名的唯一标识。
+
+保留上游的标准 `./generate.sh` 构建方式。以下本地脚本也可使用经校验的 Sparkle 归档，避免拉取其完整 Git 历史：
+
+```sh
+tools/local/bootstrap.sh
+tools/local/build.sh mac
+tools/local/build.sh ios-signed
+tools/local/build.sh test
+tools/local/build.sh ios-test
+```
+
+脚本优先使用 `.local/tools/xcodegen/2.46.0/bin/xcodegen`，否则使用 PATH 中的 XcodeGen。iPad 测试默认使用 `iPad Air 11-inch (M3)` 模拟器，需要相应运行时。
+
+Sparkle 2.8.1 从 [官方发布](https://github.com/sparkle-project/Sparkle/releases/tag/2.8.1) 下载，SHA-256：
+
+```text
+995f913935fe903d50b3be5344fc52a638f56b39ef7984bf7a44244786d28638
+```
+
+缓存位于 `.local/downloads/`，框架位于 `.local/dependencies/`。解压必须保留框架符号链接，脚本使用 macOS `ditto`。本地工程关闭 Sparkle 自动检查；升级时重新合并源码并构建，避免安装官方更新后丢失此分支功能。
+
+## 安装和登录后自动启动
+
+Mac 产物为 `build/Build/Products/Debug/OpenDisplay Dev.app`。按上游开发规范使用稳定 Debug 身份，通过以下命令启动：
+
+```sh
+./run.sh
+```
+
+iPad 产物为 `build/ios-signed/Build/Products/Debug-iphoneos/OpenSidecariOS.app`。选择 `xcrun devicectl list devices` 中的设备，使用自己的 bundle ID：
+
+```sh
+xcrun devicectl device install app --device YOUR_IPAD_DEVICE \
+  build/ios-signed/Build/Products/Debug-iphoneos/OpenSidecariOS.app
+xcrun devicectl device process launch --device YOUR_IPAD_DEVICE \
+  YOUR_IOS_BUNDLE_IDENTIFIER
+```
+
+安装用户级自动启动项：
+
+```sh
+python3 tools/local/login.py preview
+python3 tools/local/login.py install
+```
+
+启动项通过 Launch Services 打开应用，使用 `open -W` 保持单实例，并通过 `caffeinate -s` 在运行期间阻止系统休眠。它会在应用退出后重启应用；需要正常退出时先移除启动项：
+
+```sh
+python3 tools/local/login.py uninstall
+```
+
+重建 Mac 前先移除启动项，构建后再安装。**测试过程中授予屏幕录制后，不要中途重签或重建 Mac 应用**，否则需要重新核查隐私授权。
+
+Mac 运行日志位于 `~/Library/Logs/OpenDisplay Dev/`。iPad 连接日志可在应用 Settings & Help 中查看。个人签名、设备标识和本机路径只保留在本地配置与日志中。
+
+## 无头启动的边界
+
+先确认 iPad 的画面和输入正常，再断开原显示器的视频连接，验证 iPad 成为唯一显示器。第一次验收时保留恢复用的显示器和键盘。
+
+Apple 文档说明：Apple 芯片 Mac 在 macOS 26 及以上、开启 Remote Login 且网络可用时，可通过 SSH 解锁 FileVault。见 [Apple 官方说明](https://support.apple.com/en-ca/guide/security/sec8447f5049/web)。是否能在具体网络的预启动环境连通，以及解锁后能否恢复用户会话，需要单独实测；此分支不会关闭 FileVault 或自动设置登录。
+
+## 协议扩展
+
+沿用上游协议 3 对未知字段和类型的忽略规则，不改变视频和 USB 传输。Mac 在 welcome 中增加 `remoteInput: 1`，iPad 仅在收到该能力后发送：
+
+| type | 数据 |
+| --- | --- |
+| key | HID usage、down、modifiers |
+| text | 已提交的 Unicode 文本 |
+| pointer | phase=down/move/up、归一化 x/y、button=0/1/2、clicks、modifiers |
+| inputReset | 释放会话持有的按键和鼠标按钮 |
+
+修饰键仅允许 caps、shift、control、option、command、keypad、fn。原有 touch、scroll、pencil 路径保持兼容。完整新增输入功能需要配套使用本分支的 Mac 和 iPad 应用。

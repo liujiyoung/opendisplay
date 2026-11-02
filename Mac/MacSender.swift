@@ -1398,6 +1398,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     func stop() {
         stopped = true
+        let injector = inputInjector
+        queue.async { injector?.releaseRemoteInput() }
         invalidateCapturePipeline(discardingLastFrame: true)
         stopCursorPositionEcho()
         cursorImageTimer?.cancel()
@@ -2124,6 +2126,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func scheduleReconnect() {
         guard !stopped else { return }
+        inputInjector?.releaseRemoteInput()
         if everConnected {
             if let since = disconnectedSince {
                 if Date().timeIntervalSince(since) > disconnectGraceSeconds {
@@ -2569,6 +2572,22 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     if stream != nil { scheduleReconfigure() } else { _ = noteSelectionChange() }
                 }
             }
+        case "key":
+            if let hid = obj["hid"] as? Int, let down = obj["down"] as? Bool {
+                inputInjector?.handleKey(hid: hid, down: down,
+                                         modifiers: (obj["modifiers"] as? UInt64) ?? 0)
+            }
+        case "text":
+            if let text = obj["text"] as? String { inputInjector?.handleText(text) }
+        case "pointer":
+            if let phase = obj["phase"] as? String,
+               let x = obj["x"] as? Double, let y = obj["y"] as? Double {
+                inputInjector?.handlePointer(phase: phase, x: x, y: y,
+                    button: obj["button"] as? Int ?? 0, clicks: obj["clicks"] as? Int ?? 1,
+                    modifiers: obj["modifiers"] as? UInt64 ?? 0)
+            }
+        case "inputReset":
+            inputInjector?.releaseRemoteInput()
         case "touch":
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double,
@@ -3195,7 +3214,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Identify ourselves to the receiver: our protocol version and the oldest
     /// receiver version we still support.
     private func sendWelcome() {
-        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer)}")
+        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"remoteInput\":\(RemoteInput.capability)}")
     }
 
     /// Announce the operating point before video. Legacy receivers ignore the

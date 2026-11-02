@@ -32,6 +32,80 @@ final class InputInjector {
     // open but their tracking session breaks, leaving zombie menu windows
     // composited on the display (visible in the stream, unclickable).
     private let source = CGEventSource(stateID: .hidSystemState)
+    private var heldKeys = Set<CGKeyCode>()
+    private var heldPointerButtons = Set<Int>()
+
+    deinit { releaseRemoteInput() }
+
+    func handleKey(hid: Int, down: Bool, modifiers: UInt64) {
+        guard let code = RemoteInput.macKeyCode(forHID: hid) else { return }
+        let repeated = down && heldKeys.contains(code)
+        guard down || heldKeys.contains(code) else { return }
+        if down { heldKeys.insert(code) } else { heldKeys.remove(code) }
+        guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { return }
+        if (224...231).contains(hid) || hid == 57 { event.type = .flagsChanged }
+        event.flags = CGEventFlags(rawValue: modifiers & RemoteInput.modifierMask)
+        event.setIntegerValueField(.keyboardEventAutorepeat, value: repeated ? 1 : 0)
+        event.post(tap: .cghidEventTap)
+    }
+
+    func handleText(_ text: String) {
+        guard text.utf16.count <= 4096 else { return }
+        for units in RemoteInput.textChunks(text) {
+            for down in [true, false] {
+                guard let event = CGEvent(keyboardEventSource: source, virtualKey: 0, keyDown: down) else { continue }
+                event.flags = []
+                event.keyboardSetUnicodeString(stringLength: units.count, unicodeString: units)
+                event.post(tap: .cghidEventTap)
+            }
+        }
+    }
+
+    func handlePointer(phase: String, x: Double, y: Double, button: Int,
+                       clicks: Int, modifiers: UInt64) {
+        guard x.isFinite, y.isFinite, (0...2).contains(button) else { return }
+        let p = screenPoint(nx: min(max(x, 0), 1), ny: min(max(y, 0), 1))
+        let effectiveButton = phase == "move" ? (heldPointerButtons.sorted().first ?? button) : button
+        let mouseButton: CGMouseButton = effectiveButton == 1 ? .right : effectiveButton == 2 ? .center : .left
+        let type: CGEventType
+        switch phase {
+        case "down":
+            heldPointerButtons.insert(button)
+            type = button == 0 ? .leftMouseDown : button == 1 ? .rightMouseDown : .otherMouseDown
+        case "up":
+            guard heldPointerButtons.remove(button) != nil else { return }
+            type = button == 0 ? .leftMouseUp : button == 1 ? .rightMouseUp : .otherMouseUp
+        case "move":
+            type = heldPointerButtons.contains(0) ? .leftMouseDragged
+                : heldPointerButtons.contains(1) ? .rightMouseDragged
+                : heldPointerButtons.contains(2) ? .otherMouseDragged : .mouseMoved
+        default: return
+        }
+        guard let event = CGEvent(mouseEventSource: source, mouseType: type,
+                                  mouseCursorPosition: p, mouseButton: mouseButton) else { return }
+        event.flags = CGEventFlags(rawValue: modifiers & RemoteInput.modifierMask)
+        event.setIntegerValueField(.mouseEventClickState, value: Int64(min(max(clicks, 1), 3)))
+        event.post(tap: .cghidEventTap)
+    }
+
+    /// A cable loss or backgrounded iPad must never leave Command or a drag held.
+    func releaseRemoteInput() {
+        for code in heldKeys {
+            if let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false) {
+                if [54, 55, 56, 57, 58, 59, 60, 61, 62].contains(code) { event.type = .flagsChanged }
+                event.flags = []
+                event.post(tap: .cghidEventTap)
+            }
+        }
+        heldKeys.removeAll()
+        for button in Array(heldPointerButtons) {
+            let b = CGDisplayBounds(displayID)
+            let p = CGEvent(source: nil)?.location ?? b.origin
+            handlePointer(phase: "up", x: b.width > 0 ? (p.x - b.minX) / b.width : 0,
+                          y: b.height > 0 ? (p.y - b.minY) / b.height : 0,
+                          button: button, clicks: 1, modifiers: 0)
+        }
+    }
     // Synthetic OpenDisplay tablet — conspicuous in logs; not Wacom (0x056A) or
     // typical small driver IDs (1, 2, …).
     private let tabletVendorID: Int64 = 0x0D15       // "ODIS"

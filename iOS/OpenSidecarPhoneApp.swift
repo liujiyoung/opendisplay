@@ -42,6 +42,8 @@ struct ReceiverScreen: View {
     @State private var showSettings = false
     @State private var showOnboarding = false
     @State private var nagDismissed = false
+    @State private var showSoftwareKeyboard = false
+    @State private var showRemoteTools = false
     @Environment(\.scenePhase) private var scenePhase
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
@@ -77,9 +79,67 @@ struct ReceiverScreen: View {
                     Color.black.ignoresSafeArea()
                     VideoLayerView(displayLayer: model.receiver.displayLayer,
                                    receiver: model.receiver,
-                                   useMetal: metalRenderer)
+                                   useMetal: metalRenderer,
+                                   softwareKeyboard: showSoftwareKeyboard,
+                                   onToggleTools: {
+                                       withAnimation(.easeInOut(duration: 0.15)) {
+                                           showRemoteTools.toggle()
+                                       }
+                                   })
                         .id(metalRenderer)   // rebuild the layer tree on toggle
                         .ignoresSafeArea()
+                    if showRemoteTools {
+                        VStack {
+                            HStack {
+                                Spacer()
+                                HStack(spacing: 16) {
+                                    Button("Esc") {
+                                        model.receiver.sendKey(hid: 41, down: true)
+                                        model.receiver.sendKey(hid: 41, down: false)
+                                    }
+                                    Button("Tab") {
+                                        model.receiver.sendKey(hid: 43, down: true)
+                                        model.receiver.sendKey(hid: 43, down: false)
+                                    }
+                                    Menu("Mac") {
+                                        Button("Switch input source (Control-Space)") {
+                                            model.receiver.sendShortcut(hid: 44, modifierHID: 224)
+                                        }
+                                        Button("Switch app (Command-Tab)") {
+                                            model.receiver.sendShortcut(hid: 43, modifierHID: 227)
+                                        }
+                                        Button("Copy (Command-C)") {
+                                            model.receiver.sendShortcut(hid: 6, modifierHID: 227)
+                                        }
+                                        Button("Paste (Command-V)") {
+                                            model.receiver.sendShortcut(hid: 25, modifierHID: 227)
+                                        }
+                                    }
+                                    Button {
+                                        showSoftwareKeyboard.toggle()
+                                    } label: {
+                                        Image(systemName: showSoftwareKeyboard ? "keyboard.chevron.compact.down" : "keyboard")
+                                    }
+                                    .accessibilityLabel("Toggle iPad keyboard")
+                                    Button { showSettings = true } label: { Image(systemName: "gearshape") }
+                                    Button {
+                                        withAnimation(.easeInOut(duration: 0.15)) {
+                                            showRemoteTools = false
+                                        }
+                                    } label: {
+                                        Image(systemName: "xmark")
+                                    }
+                                    .accessibilityLabel("Hide controls")
+                                }
+                                .padding(12)
+                                .background(.ultraThinMaterial, in: Capsule())
+                            }
+                            Spacer()
+                        }
+                        .padding(.top, 44)
+                        .padding(.horizontal, 12)
+                        .disabled(!model.receiver.supportsRemoteInput)
+                    }
                     if showAnalytics {
                         VStack {
                             Spacer()
@@ -100,7 +160,7 @@ struct ReceiverScreen: View {
                 OnboardingView { onboardingDismissed = true }
             }
         }
-        .ignoresSafeArea(edges: isStreaming ? .all : [])
+        .ignoresSafeArea(.container, edges: isStreaming ? .all : [])
         .statusBarHidden(isStreaming)
         .systemOverlaysHidden(isStreaming)
         .sheet(isPresented: $showSettings) {
@@ -129,6 +189,7 @@ struct ReceiverScreen: View {
             showSettings = true
         }
         .onChange(of: scenePhase) { phase in
+            if phase != .active { model.receiver.resetRemoteInput() }
             Log.info("scenePhase -> \(String(describing: phase))")
             switch phase {
             case .active: model.sceneDidActivate()
@@ -159,6 +220,7 @@ struct ReceiverScreen: View {
             model.appWillTerminate()
         }
         .onChange(of: model.receiver.connected) { isConnected in
+            if !isConnected { showRemoteTools = false }
             // The first valid connection retires the onboarding hint for good.
             if isConnected {
                 hasConnectedBefore = true
@@ -428,6 +490,8 @@ struct SettingsView: View {
                     Label("Rotate the \(deviceKind) for a vertical second monitor.",
                           systemImage: "rotate.right")
                     Label("Touch: tap to click, drag to drag, two-finger pan to scroll.",
+                          systemImage: "hand.tap")
+                    Label("Three-finger tap on the screen to show or hide controls. Controls stay hidden during normal use.",
                           systemImage: "hand.tap")
                 } header: {
                     Text("How to connect")
@@ -774,6 +838,8 @@ struct VideoLayerView: UIViewRepresentable {
     let displayLayer: AVSampleBufferDisplayLayer
     let receiver: StreamReceiver
     let useMetal: Bool
+    let softwareKeyboard: Bool
+    let onToggleTools: () -> Void
 
     func makeUIView(context: Context) -> VideoView {
         let view = VideoView()
@@ -781,6 +847,10 @@ struct VideoLayerView: UIViewRepresentable {
         view.clipsToBounds = true   // a held frame can be larger than a folded screen
         view.isMultipleTouchEnabled = true
         view.receiver = receiver
+        view.onToggleTools = onToggleTools
+        view.keyboardInput.receiver = receiver
+        view.addSubview(view.keyboardInput)
+        view.keyboardInput.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
 
         Log.info("video view: metal=\(useMetal)")
         if useMetal, let renderer = MetalVideoRenderer() {
@@ -797,6 +867,7 @@ struct VideoLayerView: UIViewRepresentable {
             receiver.onDecodedFrame = nil   // route frames back to AVSBDL
             displayLayer.frame = view.bounds
             view.layer.addSublayer(displayLayer)
+            view.videoLayer = displayLayer
         }
 
         view.inputEngine.normalize = { [weak view] point in view?.normalized(point) }
@@ -814,6 +885,19 @@ struct VideoLayerView: UIViewRepresentable {
         pan.minimumNumberOfTouches = 2
         pan.maximumNumberOfTouches = 2
         view.addGestureRecognizer(pan)
+
+        let toolsTap = UITapGestureRecognizer(target: view, action: #selector(VideoView.didThreeFingerTap(_:)))
+        toolsTap.numberOfTouchesRequired = 3
+        toolsTap.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.direct.rawValue)]
+        view.addGestureRecognizer(toolsTap)
+
+        let hover = UIHoverGestureRecognizer(target: view, action: #selector(VideoView.pointerHover(_:)))
+        hover.allowedTouchTypes = [NSNumber(value: UITouch.TouchType.indirectPointer.rawValue)]
+        view.addGestureRecognizer(hover)
+        let scroll = UIPanGestureRecognizer(target: view, action: #selector(VideoView.didTwoFingerPan(_:)))
+        scroll.allowedTouchTypes = []
+        scroll.allowedScrollTypesMask = .all
+        view.addGestureRecognizer(scroll)
 
         // Local cursor echo: position updates ride the ~2ms control path
         // instead of the ~30ms video path, so the pointer feels native.
@@ -837,12 +921,49 @@ struct VideoLayerView: UIViewRepresentable {
     func updateUIView(_ uiView: VideoView, context: Context) {
         // videoSize arrives after the format description — re-fit the layers.
         uiView.setNeedsLayout()
+        uiView.onToggleTools = onToggleTools
+        uiView.keyboardInput.setSoftwareKeyboard(softwareKeyboard)
     }
 
     final class VideoView: UIView {
         weak var receiver: StreamReceiver?
         var metalRenderer: MetalVideoRenderer?
+        var videoLayer: AVSampleBufferDisplayLayer?
         let inputEngine = InputCaptureEngine()
+        let keyboardInput = RemoteKeyboardView()
+        var onToggleTools: (() -> Void)?
+        private var pointerButton = 0
+
+        @objc func didThreeFingerTap(_ recognizer: UITapGestureRecognizer) {
+            guard recognizer.state == .ended else { return }
+            onToggleTools?()
+        }
+
+        override func didMoveToWindow() {
+            super.didMoveToWindow()
+            if window != nil { keyboardInput.focus() }
+            else { keyboardInput.releaseKeys() }
+        }
+
+        @objc func pointerHover(_ recognizer: UIHoverGestureRecognizer) {
+            guard recognizer.state == .began || recognizer.state == .changed,
+                  let p = normalized(recognizer.location(in: self)) else { return }
+            receiver?.sendPointer(phase: "move", x: p.x, y: p.y,
+                                  modifiers: UInt64(recognizer.modifierFlags.rawValue))
+        }
+
+        private func sendPointer(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?) {
+            guard let touch = touches.first(where: { $0.type == .indirectPointer }),
+                  let p = normalized(touch.location(in: self)) else { return }
+            if phase == "began" {
+                keyboardInput.focus()
+                pointerButton = event?.buttonMask.contains(.secondary) == true ? 1
+                    : event?.buttonMask.contains(.button(3)) == true ? 2 : 0
+            }
+            let wirePhase = phase == "began" ? "down" : phase == "moved" ? "move" : "up"
+            receiver?.sendPointer(phase: wirePhase, x: p.x, y: p.y, button: pointerButton,
+                                  clicks: touch.tapCount, modifiers: UInt64(event?.modifierFlags.rawValue ?? 0))
+        }
 
         private let cursorLayer: CALayer = {
             let layer = CALayer()
@@ -943,8 +1064,9 @@ struct VideoLayerView: UIViewRepresentable {
             if let renderer = metalRenderer {
                 renderer.metalLayer.frame = videoRect() ?? bounds
             } else {
-                layer.sublayers?.first?.frame = videoRect() ?? bounds
+                videoLayer?.frame = videoRect() ?? bounds
             }
+            keyboardInput.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
             CATransaction.commit()
             CATransaction.begin()
             CATransaction.setDisableActions(true)
@@ -955,7 +1077,7 @@ struct VideoLayerView: UIViewRepresentable {
             let video = receiver?.videoSize ?? .zero
             let line = "layout: bounds=\(Int(bounds.width))x\(Int(bounds.height))"
                 + " video=\(Int(video.width))x\(Int(video.height))"
-                + " layer=\(Int(layer.sublayers?.first?.frame.width ?? -1))x\(Int(layer.sublayers?.first?.frame.height ?? -1))"
+                + " layer=\(Int((metalRenderer?.metalLayer ?? videoLayer)?.frame.width ?? -1))x\(Int((metalRenderer?.metalLayer ?? videoLayer)?.frame.height ?? -1))"
             if line != lastLoggedLayout {
                 lastLoggedLayout = line
                 Log.info(line)
@@ -1017,7 +1139,7 @@ struct VideoLayerView: UIViewRepresentable {
 
         private func isFinger(_ touch: UITouch) -> Bool {
             switch touch.type {
-            case .direct, .indirectPointer: return true
+            case .direct: return true
             default: return false
             }
         }
@@ -1189,6 +1311,10 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         private func routeTouches(_ phase: String, _ touches: Set<UITouch>, _ event: UIEvent?, ended: Bool) {
+            if touches.contains(where: { $0.type == .indirectPointer }) {
+                if receiver?.supportsRemoteInput == true { sendPointer(phase, touches, event) }
+                else { sendPencilAsTouch(phase, touches.filter { $0.type == .indirectPointer }, event) }
+            }
             let pencil = touches.filter { isPencil($0) }
             let finger = touches.filter { isFinger($0) }
             let usePencilWire = receiver?.macSupportsPencilWire ?? false
