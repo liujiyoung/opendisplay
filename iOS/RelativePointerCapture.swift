@@ -11,18 +11,33 @@ final class RelativePointerCapture: ObservableObject {
     @Published private(set) var hasMouse = false
     @Published private(set) var locked = false
     @Published var enabled = false {
-        didSet { if oldValue && !enabled { releaseInput() } }
+        didSet {
+            guard oldValue != enabled else { return }
+            if enabled {
+                // A keyboard case can retain its GCMouse identity while its
+                // input profile is replaced across app suspension/resumption.
+                refreshMice()
+                synchronizeLock()
+            } else { releaseInput() }
+        }
     }
     var wantsLock: Bool { enabled && hasMouse }
     var isCapturing: Bool { wantsLock && locked }
 
     private var mice: [ObjectIdentifier: GCMouse] = [:]
+    private var mouseInputs: [ObjectIdentifier: GCMouseInput] = [:]
     private var observers: [NSObjectProtocol] = []
     private var lockObserver: NSObjectProtocol?
     private weak var observedScene: UIWindowScene?
     private var clicks = RemoteClickTracker()
     private var travel = CGPoint.zero
     private var loggedMotion = false
+    private var stateMonitor: Timer?
+    private var rawMotionCount = 0
+    private var forwardedMotionCount = 0
+    private var lastReport = ProcessInfo.processInfo.systemUptime
+    private var reportIdleWindow = false
+    var requestLockUpdate: (() -> Void)?
 
     init() {
         for name in [Notification.Name.GCMouseDidConnect, .GCMouseDidDisconnect] {
@@ -32,9 +47,13 @@ final class RelativePointerCapture: ObservableObject {
             })
         }
         refreshMice()
+        stateMonitor = Timer.scheduledTimer(withTimeInterval: 1, repeats: true) { [weak self] _ in
+            DispatchQueue.main.async { self?.reconcileCapture() }
+        }
     }
 
     deinit {
+        stateMonitor?.invalidate()
         for token in observers { NotificationCenter.default.removeObserver(token) }
         if let lockObserver { NotificationCenter.default.removeObserver(lockObserver) }
     }
@@ -43,15 +62,52 @@ final class RelativePointerCapture: ObservableObject {
         guard observedScene !== scene else { return }
         if let lockObserver { NotificationCenter.default.removeObserver(lockObserver) }
         observedScene = scene
-        guard let state = scene?.pointerLockState else { setLocked(false); return }
-        setLocked(state.isLocked)
+        synchronizeLock()
+        guard scene != nil else { return }
         lockObserver = NotificationCenter.default.addObserver(
-            forName: UIPointerLockState.didChangeNotification, object: state, queue: .main
+            forName: UIPointerLockState.didChangeNotification, object: nil, queue: .main
         ) { [weak self] note in
-            guard let state = note.object as? UIPointerLockState else { return }
-            let locked = state.isLocked
-            DispatchQueue.main.async { self?.setLocked(locked) }
+            // UIKit documents the scene in userInfo. Read the current state
+            // when handling the notification instead of applying a queued,
+            // potentially obsolete lock value after a foreground transition.
+            let changedScene = note.userInfo?[UIPointerLockState.sceneUserInfoKey] as? UIScene
+            DispatchQueue.main.async {
+                guard let self,
+                      changedScene == nil || changedScene === self.observedScene else { return }
+                self.synchronizeLock()
+            }
         }
+    }
+
+    private func synchronizeLock() {
+        setLocked(observedScene?.pointerLockState?.isLocked ?? false)
+    }
+
+    private func reconcileCapture() {
+        let active = UIApplication.shared.applicationState == .active
+        if enabled && active {
+            let current = GCMouse.mice()
+            let ids = Set(current.map(ObjectIdentifier.init))
+            if ids != Set(mice.keys) || current.contains(where: {
+                $0.mouseInput !== mouseInputs[ObjectIdentifier($0)]
+            }) {
+                refreshMice()
+            }
+            synchronizeLock()
+            // A transient system UI can release the lock without changing
+            // our preference. Ask UIKit to reconsider once it is gone.
+            if wantsLock && !locked { requestLockUpdate?() }
+        }
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastReport >= 5 else { return }
+        if rawMotionCount > 0 || reportIdleWindow {
+            Log.info("pointer input: raw=\(rawMotionCount) forwarded=\(forwardedMotionCount)"
+                     + " enabled=\(enabled) locked=\(locked) active=\(active) mice=\(mice.count)")
+        }
+        reportIdleWindow = rawMotionCount > 0
+        rawMotionCount = 0
+        forwardedMotionCount = 0
+        lastReport = now
     }
 
     private func setLocked(_ value: Bool) {
@@ -71,7 +127,8 @@ final class RelativePointerCapture: ObservableObject {
         let current = GCMouse.mice()
         let ids = Set(current.map(ObjectIdentifier.init))
         for id in Array(mice.keys) where !ids.contains(id) {
-            if let input = mice.removeValue(forKey: id)?.mouseInput {
+            mice.removeValue(forKey: id)
+            if let input = mouseInputs.removeValue(forKey: id) {
                 input.mouseMovedHandler = nil
                 input.leftButton.pressedChangedHandler = nil
                 input.rightButton?.pressedChangedHandler = nil
@@ -79,9 +136,18 @@ final class RelativePointerCapture: ObservableObject {
             }
             releaseInput()
         }
-        for mouse in current where mice[ObjectIdentifier(mouse)] == nil {
+        for mouse in current {
             guard let input = mouse.mouseInput else { continue }
-            mice[ObjectIdentifier(mouse)] = mouse
+            let id = ObjectIdentifier(mouse)
+            if let old = mouseInputs[id], old !== input {
+                old.mouseMovedHandler = nil
+                old.leftButton.pressedChangedHandler = nil
+                old.rightButton?.pressedChangedHandler = nil
+                old.middleButton?.pressedChangedHandler = nil
+                releaseInput()
+            }
+            mice[id] = mouse
+            mouseInputs[id] = input
             mouse.handlerQueue = .main
             input.mouseMovedHandler = { [weak self] _, dx, dy in
                 DispatchQueue.main.async { self?.move(dx: Double(dx), dy: -Double(dy)) }
@@ -96,12 +162,14 @@ final class RelativePointerCapture: ObservableObject {
                 DispatchQueue.main.async { self?.button(2, down: pressed) }
             }
         }
-        hasMouse = !mice.isEmpty
+        if hasMouse != !mice.isEmpty { hasMouse = !mice.isEmpty }
         Log.info("raw pointing devices: \(mice.count)")
     }
 
     private func move(dx: Double, dy: Double) {
+        rawMotionCount += 1
         guard isCapturing, dx.isFinite, dy.isFinite else { return }
+        forwardedMotionCount += 1
         if !loggedMotion { Log.info("relative pointer input active"); loggedMotion = true }
         travel.x += dx
         travel.y += dy
@@ -128,6 +196,7 @@ final class ReceiverHostingController: UIHostingController<ReceiverScreen> {
         let capture = RelativePointerCapture()
         pointerCapture = capture
         super.init(rootView: ReceiverScreen(pointerCapture: capture))
+        capture.requestLockUpdate = { [weak self] in self?.setNeedsUpdateOfPrefersPointerLocked() }
         subscription = capture.objectWillChange.sink { [weak self] in
             DispatchQueue.main.async { self?.setNeedsUpdateOfPrefersPointerLocked() }
         }
