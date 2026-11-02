@@ -10,6 +10,19 @@ enum TestPattern {
     // One window per virtual display — multi-device sessions each get their
     // own pattern, so all pipelines stream at once during measurements.
     private static var windows: [CGDirectDisplayID: NSWindow] = [:]
+    private static var screenObserver: NSObjectProtocol?
+
+    private static func alignWindows() {
+        for (id, window) in windows {
+            guard let screen = NSScreen.screens.first(where: {
+                ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == id
+            }) else { continue }
+            if window.frame != screen.frame {
+                window.setFrame(screen.frame, display: true)
+                Log.info("test pattern aligned on display \(id): \(window.frame)")
+            }
+        }
+    }
 
     static func show(on displayID: CGDirectDisplayID) {
         hide(on: displayID)
@@ -19,12 +32,20 @@ enum TestPattern {
                 if let screen = NSScreen.screens.first(where: {
                     ($0.deviceDescription[NSDeviceDescriptionKey("NSScreenNumber")] as? CGDirectDisplayID) == displayID
                 }) {
-                    let w = NSWindow(contentRect: screen.frame, styleMask: [.borderless],
-                                     backing: .buffered, defer: false)
+                    let w = PatternWindow(contentRect: screen.frame, styleMask: [.borderless],
+                                          backing: .buffered, defer: false, screen: screen)
                     w.contentView = NSHostingView(rootView: PatternView())
                     w.setFrame(screen.frame, display: true)
                     w.orderFrontRegardless()
                     windows[displayID] = w
+                    if screenObserver == nil {
+                        screenObserver = NotificationCenter.default.addObserver(
+                            forName: NSApplication.didChangeScreenParametersNotification,
+                            object: nil, queue: .main
+                        ) { _ in
+                            Task { @MainActor in alignWindows() }
+                        }
+                    }
                     Log.info("test pattern window shown on display \(displayID)")
                     return
                 }
@@ -36,7 +57,17 @@ enum TestPattern {
 
     static func hide(on displayID: CGDirectDisplayID) {
         windows.removeValue(forKey: displayID)?.orderOut(nil)
+        if windows.isEmpty, let screenObserver {
+            NotificationCenter.default.removeObserver(screenObserver)
+            self.screenObserver = nil
+        }
     }
+}
+
+/// Keep a test window on its requested display even while macOS is settling
+/// a new virtual display's HiDPI mode and arrangement.
+private final class PatternWindow: NSWindow {
+    override func constrainFrameRect(_ frameRect: NSRect, to screen: NSScreen?) -> NSRect { frameRect }
 }
 
 private struct PatternView: View {

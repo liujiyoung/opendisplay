@@ -2505,6 +2505,27 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             return
         }
         switch type {
+        case "cursorProbe":
+            guard let id = (obj["id"] as? NSNumber)?.uint64Value else { return }
+            let generation = connectionGeneration
+            cursorQueue.async { [weak self] in
+                guard let self, self.cursorSessionGeneration == generation, !self.stopped else { return }
+                let state = self.lastCursorSent
+                let position = state.visible
+                    ? String(format: "\"x\":%.4f,\"y\":%.4f,\"v\":1", state.x, state.y)
+                    : "\"v\":0"
+                self.sendCursor(position + ",\"probe\":\(id)")
+            }
+        case "latencyStats":
+            var report = obj
+            report["quality"] = quality.rawValue
+            cursorNetworkLock.lock()
+            report["udpConfirmed"] = cursorChannelConfirmed
+            cursorNetworkLock.unlock()
+            if let json = try? JSONSerialization.data(withJSONObject: report),
+               let line = String(data: json, encoding: .utf8) {
+                Log.info("LATENCY-STATS \(line)")
+            }
         case "ping":
             // Echo with our clock so the phone can estimate the offset
             // (NTP-style) and compute true end-to-end frame latency.
@@ -3230,7 +3251,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Identify ourselves to the receiver: our protocol version and the oldest
     /// receiver version we still support.
     private func sendWelcome() {
-        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"remoteInput\":\(RemoteInput.relativePointerCapability)}")
+        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"remoteInput\":\(RemoteInput.relativePointerCapability),\"latencyProbes\":1}")
     }
 
     /// Announce the operating point before video. Legacy receivers ignore the

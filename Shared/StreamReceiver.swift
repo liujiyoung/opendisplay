@@ -145,6 +145,16 @@ final class StreamReceiver: ObservableObject {
     // asyncAfter chains) so stop() can actually silence them — see #75.
     private var pingTimer: DispatchSourceTimer?
     private var watchdogTimer: DispatchSourceTimer?
+    private var latencyProbeTimer: DispatchSourceTimer?
+    private var supportsLatencyProbes = false
+    private var latencyProbeID: UInt64 = 0
+    private var latencyPending: [UInt64: Double] = [:]
+    private var cursorLatencySamples: [(ms: Double, path: String)] = []
+    private var appLatencySamples: [Double] = []
+    private var latencySent = 0
+    private var latencyExpired = 0
+    private var latencyReportAt = ProcessInfo.processInfo.systemUptime
+    private var latencySession = UUID().uuidString
 
     private var framesThisWindow = 0
     private var fpsWindowStart = Date()
@@ -383,6 +393,7 @@ final class StreamReceiver: ObservableObject {
     func stop(completion: (() -> Void)? = nil) {
         queue.async {
             self.pingTimer?.cancel(); self.pingTimer = nil
+            self.latencyProbeTimer?.cancel(); self.latencyProbeTimer = nil
             self.watchdogTimer?.cancel(); self.watchdogTimer = nil
             self.addrWatchTimer?.cancel(); self.addrWatchTimer = nil
             self.pendingConnections.forEach { $0.cancel() }
@@ -415,6 +426,7 @@ final class StreamReceiver: ObservableObject {
         queue.async {
             guard paused != self.renderingPaused else { return }
             self.renderingPaused = paused
+            self.resetLatencySamples()
             Log.info(paused ? "rendering paused (backgrounded)" : "rendering resumed")
             if !paused {
                 self.displayLayer.flush()
@@ -588,7 +600,7 @@ final class StreamReceiver: ObservableObject {
         } else {
             cursorLostThisWindow += Int(seq - lastCursorSeq - 1)
         }
-        applyCursor(obj)
+        applyCursor(obj, path: "UDP")
     }
 
     private func startListener() {
@@ -765,6 +777,16 @@ final class StreamReceiver: ObservableObject {
         ping.resume()
         pingTimer = ping
 
+        latencyProbeTimer?.cancel()
+        latencyProbeTimer = nil
+        if UserDefaults.standard.bool(forKey: "measureLatency") {
+            let probe = DispatchSource.makeTimerSource(queue: queue)
+            probe.schedule(deadline: .now() + 1, repeating: .milliseconds(200))
+            probe.setEventHandler { [weak self] in self?.sendLatencyProbe() }
+            probe.resume()
+            latencyProbeTimer = probe
+        }
+
         addrWatchTimer?.cancel()
         if advertisesAddresses {
             let addrWatch = DispatchSource.makeTimerSource(queue: queue)
@@ -797,6 +819,48 @@ final class StreamReceiver: ObservableObject {
         watchdogTimer = watchdog
     }
 
+    /// Opt-in, monotonic-clock measurement through the real cursor return path.
+    /// Five probes/s add little traffic and remain identical across A/B builds.
+    private func sendLatencyProbe() {
+        guard connection?.state == .ready, supportsLatencyProbes, !renderingPaused else { return }
+        let now = ProcessInfo.processInfo.systemUptime
+        for (id, sent) in latencyPending where now - sent > 10 {
+            latencyPending.removeValue(forKey: id)
+            latencyExpired += 1
+        }
+        latencyProbeID &+= 1
+        latencyPending[latencyProbeID] = now
+        latencySent += 1
+        sendControl(["type": "cursorProbe", "id": latencyProbeID])
+        guard now - latencyReportAt >= 5 else { return }
+        let samples = cursorLatencySamples.map(\.ms)
+        func mean(_ values: [Double]) -> Double {
+            values.isEmpty ? 0 : values.reduce(0, +) / Double(values.count)
+        }
+        sendControl([
+            "type": "latencyStats", "schema": 1, "session": latencySession,
+            "transport": transport, "seconds": now - latencyReportAt,
+            "sent": latencySent, "expired": latencyExpired, "pending": latencyPending.count,
+            "cursorSamples": samples, "cursorPaths": cursorLatencySamples.map(\.path),
+            "cursorMeanMs": mean(samples), "cursorP95Ms": percentile(samples, 0.95),
+            "appSamples": appLatencySamples, "appMeanMs": mean(appLatencySamples),
+        ])
+        cursorLatencySamples.removeAll(keepingCapacity: true)
+        appLatencySamples.removeAll(keepingCapacity: true)
+        latencySent = 0
+        latencyExpired = 0
+        latencyReportAt = now
+    }
+
+    private func resetLatencySamples() {
+        latencyPending.removeAll()
+        cursorLatencySamples.removeAll()
+        appLatencySamples.removeAll()
+        latencySent = 0
+        latencyExpired = 0
+        latencyReportAt = ProcessInfo.processInfo.systemUptime
+    }
+
     /// JSON on the video channel (pong, ping liveness) — payloads starting '{'.
     private func handleVideoChannelJSON(_ data: Data) {
         guard let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
@@ -806,6 +870,9 @@ final class StreamReceiver: ObservableObject {
             guard let t1 = obj["t"] as? Double, let mt = obj["mt"] as? Double else { return }
             let t2 = nowMs
             let rtt = t2 - t1
+            if latencyProbeTimer != nil, rtt >= 0, rtt < 10_000, !renderingPaused {
+                appLatencySamples.append(rtt)
+            }
             guard rtt >= 0, rtt < 2000 else { return }
             let offset = mt - (t1 + t2) / 2
             offsetSamples.append((rtt, offset))
@@ -849,6 +916,7 @@ final class StreamReceiver: ObservableObject {
             // old Mac can't diagnose that itself, so we surface it here.
             let macPV = obj["pv"] as? Int ?? WireProtocol.assumedWhenAbsent
             let remoteInput = obj["remoteInput"] as? Int ?? 0
+            supportsLatencyProbes = (obj["latencyProbes"] as? Int ?? 0) >= 1
             DispatchQueue.main.async {
                 self.macProtocolVersion = macPV
                 self.supportsRemoteInput = remoteInput >= RemoteInput.capability
@@ -904,7 +972,7 @@ final class StreamReceiver: ObservableObject {
     /// channel switch a TCP frame queued behind video would otherwise land
     /// after (and override) a newer UDP position. Old senders put no `s` on
     /// TCP frames; those apply unconditionally, as before.
-    private func applyCursor(_ obj: [String: Any]) {
+    private func applyCursor(_ obj: [String: Any], path: String = "TCP") {
         if let seq = (obj["s"] as? NSNumber)?.uint64Value {
             guard seq > lastCursorSeq else { return }
             lastCursorSeq = seq
@@ -912,14 +980,28 @@ final class StreamReceiver: ObservableObject {
         let visible = (obj["v"] as? Int ?? 0) == 1
         let x = obj["x"] as? Double ?? 0
         let y = obj["y"] as? Double ?? 0
+        let probe = (obj["probe"] as? NSNumber)?.uint64Value
         cursorUpdatesThisWindow += 1
         DispatchQueue.main.async {
             self.cursorState = (x, y, visible)
             self.onCursor?(x, y, visible)
+            if let probe {
+                let completed = ProcessInfo.processInfo.systemUptime
+                self.queue.async {
+                    guard let sent = self.latencyPending.removeValue(forKey: probe) else { return }
+                    let ms = (completed - sent) * 1000
+                    if ms >= 0, ms <= 10_000, !self.renderingPaused {
+                        self.cursorLatencySamples.append((ms, path))
+                    }
+                }
+            }
         }
     }
 
     private func resetStreamState() {
+        resetLatencySamples()
+        supportsLatencyProbes = false
+        latencySession = UUID().uuidString
         buffer.removeAll(keepingCapacity: true)
         formatDesc = nil
         streamCodec = "h264"
