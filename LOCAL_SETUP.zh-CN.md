@@ -51,7 +51,7 @@ Mac 操作界面在 **Quality 下方**提供 **Adaptive bitrate (Wi-Fi)** 开关
 
 编码器若在至少十五次回调中主动丢掉 20% 以上的帧，策略会恢复上一档保持出帧的安全码率，并提高本连接的码率下限；内容变复杂时可继续提高安全下限。这样避免以持续大幅降帧换取较低平均延迟。新连接或编码器重建时重新评估；USB 恢复原档位固定码率。使用 VideoToolbox 的平均码率目标，不附加硬字节上限；可用 `-disableAdaptiveBitrate YES` 关闭自动调整。量化控制与码率属性采用公开接口，见 [Apple 的低延迟编码说明](https://developer.apple.com/videos/play/wwdc2021/10158/)。
 
-Caps Lock 开关位于自适应码率开关下方。该选项要求配套更新本分支 Mac 与 iPad 应用：iPad 转发 Caps Lock 按键，由 Mac 决定大小写或输入法行为。为避免系统把 Caps Lock 修饰状态解释成输入法切换，默认模式仅处理字母大小写，保留数字、标点和 Ctrl / Command / Option 快捷键。iPad 自身的 Caps Lock 状态不会覆盖 Mac 会话中的大小写状态。已验证默认关闭、切换即时生效、重启保存，以及关闭时大小写往返且 Mac 的 ABC 输入源不变。
+Caps Lock 开关位于自适应码率开关下方。该选项要求配套更新本分支 Mac 与 iPad 应用：iPad 转发 Caps Lock 按键，由 Mac 决定大小写或输入法行为。为避免系统把 Caps Lock 修饰状态解释成输入法切换，默认模式仅处理字母大小写，保留数字、标点和 Ctrl / Command / Option 快捷键。iPad 自身的 Caps Lock 状态不会覆盖 Mac 会话中的大小写状态。已验证默认关闭、切换即时生效、重启保存；用户实测确认关闭时大小写往返且 Mac 的 ABC 输入源不变，开启时中英文往返正常且英文不锁大写。验收后恢复关闭，保持默认大小写模式。
 
 ## 构建
 
