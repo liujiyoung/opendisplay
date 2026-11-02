@@ -12,6 +12,8 @@ parser = argparse.ArgumentParser()
 parser.add_argument('action', choices=['preview', 'install', 'uninstall'])
 parser.add_argument('--test-pattern', action='store_true',
                     help='Show the same animated workload for latency comparisons.')
+parser.add_argument('--disable-independent-control', action='store_true',
+                    help='Use the legacy control path for same-build latency comparisons.')
 args = parser.parse_args()
 root = Path(__file__).resolve().parents[2]
 local_label = 'com.peetzweg.opensidecar.headless'
@@ -42,6 +44,8 @@ config = {
 }
 if args.test_pattern:
     config['ProgramArguments'] += ['-testPattern', 'YES']
+if args.disable_independent_control:
+    config['ProgramArguments'] += ['-disableIndependentControl', 'YES']
 if args.action == 'preview':
     dest = root / '.local/headless-launchagent.plist'
     dest.parent.mkdir(parents=True, exist_ok=True)

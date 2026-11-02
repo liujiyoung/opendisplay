@@ -17,6 +17,11 @@ def summarize(rows):
         raise ValueError('Connection changed during measurement; repeat the run')
     if len({r['quality'] for r in rows}) != 1:
         raise ValueError('Quality changed during measurement; repeat the run')
+    control_paths = {r.get('controlChannel', 'video') for r in rows}
+    if len(control_paths) != 1:
+        raise ValueError('Control channel changed during measurement; repeat the run')
+    if any(r.get('senderControlChannel', r.get('controlChannel', 'video')) != r.get('controlChannel', 'video') for r in rows):
+        raise ValueError('Sender/receiver control channels disagree')
 
     def stats(values):
         if not values or not all(math.isfinite(x) and x >= 0 for x in values):
@@ -35,6 +40,7 @@ def summarize(rows):
         raise ValueError('Cursor sample/path counts do not match')
     return {
         'transport': 'WiFi', 'quality': rows[0]['quality'],
+        'control_channel': rows[0].get('controlChannel', 'video'),
         'windows': len(rows), 'seconds': sum(r['seconds'] for r in rows),
         'cursor_roundtrip': stats(samples),
         'app_roundtrip': stats([x for r in rows for x in r['appSamples']]),

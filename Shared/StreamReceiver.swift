@@ -95,6 +95,13 @@ final class StreamReceiver: ObservableObject {
     private var cursorListenerReady = false
     private var cursorConnection: NWConnection?
     private var cursorPortAnnounced = false
+    private var controlListener: NWListener?
+    private var controlListenerReady = false
+    private var controlCandidates: [ControlSocket] = []
+    private var controlSocket: ControlSocket?
+    private var controlToken = UUID().uuidString
+    private var controlHandoff = ControlHandoff()
+    private var controlPort: UInt16 { port &+ 2 }
     // Newcomer connections still proving themselves against a live session
     // (see the listener). Tracked so stop() and adoption can cancel them —
     // an untracked silent socket would sit parked forever and could even
@@ -470,6 +477,7 @@ final class StreamReceiver: ObservableObject {
                 self.listener = nil
                 self.listenerHealthy = false
                 self.stopCursorListener()
+                self.stopControlListener()
                 self.setConnected(false)
                 self.setStatus(status)
                 completion?()
@@ -688,6 +696,112 @@ final class StreamReceiver: ObservableObject {
         }
         listener?.start(queue: queue)
         startCursorListener()
+        startControlListener()
+    }
+
+    // MARK: - Independent reliable control channel (Wi-Fi)
+
+    private func startControlListener() {
+        guard controlListener == nil else { return }
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        let params = NWParameters(tls: nil, tcp: tcp)
+        params.allowLocalEndpointReuse = true
+        params.serviceClass = .responsiveData
+        do {
+            let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: controlPort)!)
+            controlListener = listener
+            listener.newConnectionHandler = { [weak self] conn in
+                guard let self, self.controlCandidates.count < 2 else { conn.cancel(); return }
+                let socket = ControlSocket(connection: conn, owner: self.queue,
+                    onMessage: { [weak self] socket, payload in self?.receiveDedicatedControl(payload, on: socket) },
+                    onEnd: { [weak self] socket in self?.controlSocketEnded(socket) })
+                self.controlCandidates.append(socket)
+                socket.start()
+                self.queue.asyncAfter(deadline: .now() + 3) { [weak self, weak socket] in
+                    guard let self, let socket,
+                          self.controlCandidates.contains(where: { $0 === socket }) else { return }
+                    socket.cancel()
+                }
+            }
+            listener.stateUpdateHandler = { [weak self, weak listener] state in
+                guard let self, let listener, self.controlListener === listener else { return }
+                switch state {
+                case .ready:
+                    self.controlListenerReady = true
+                    Log.info("control listener ready on tcp :\(self.controlPort)")
+                    if let connection = self.connection, connection.state == .ready { self.sendHello(on: connection) }
+                case .failed:
+                    self.controlListenerReady = false
+                    self.controlListener = nil
+                    listener.cancel()
+                    self.queue.asyncAfter(deadline: .now() + 1) { [weak self] in
+                        guard let self, self.listener != nil else { return }
+                        self.startControlListener()
+                    }
+                default: break
+                }
+            }
+            listener.start(queue: queue)
+        } catch { Log.info("control listener unavailable — using video TCP") }
+    }
+
+    private func resetControlChannel() {
+        let sockets = controlCandidates + (controlSocket.map { [$0] } ?? [])
+        controlCandidates.removeAll()
+        controlSocket = nil
+        controlHandoff.reset()
+        sockets.forEach { $0.cancel() }
+    }
+
+    private func stopControlListener() {
+        controlListener?.cancel()
+        controlListener = nil
+        controlListenerReady = false
+        resetControlChannel()
+    }
+
+    private func controlSocketEnded(_ socket: ControlSocket) {
+        controlCandidates.removeAll { $0 === socket }
+        guard controlSocket === socket else { return }
+        let switched = controlHandoff.phase != .video
+        resetControlChannel()
+        if switched {
+            // Some input may already have been injected. Replaying it on the
+            // old stream could double a click or leave a modifier held.
+            Log.info("control channel lost — reconnecting the session without replay")
+            if let connection { endVideoSession(connection) }
+        }
+    }
+
+    private func receiveDedicatedControl(_ payload: Data, on socket: ControlSocket) {
+        guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+              let type = obj["type"] as? String else { socket.cancel(); return }
+        if controlSocket !== socket {
+            guard controlCandidates.contains(where: { $0 === socket }),
+                  controlSocket == nil, connection?.state == .ready,
+                  type == "controlBind", obj["token"] as? String == controlToken,
+                  let connection else { socket.cancel(); return }
+            controlCandidates.removeAll { $0 === socket }
+            controlSocket = socket
+            controlHandoff.begin()
+            // This barrier is ordered after every input already sent on video.
+            sendVideoControl(["type": "controlBarrier", "token": controlToken], on: connection)
+            queue.asyncAfter(deadline: .now() + 3) { [weak self, weak socket] in
+                guard let self, let socket, self.controlSocket === socket,
+                      self.controlHandoff.phase == .switching else { return }
+                socket.cancel()
+            }
+            return
+        }
+        if type == "controlReady", obj["token"] as? String == controlToken {
+            let pending = controlHandoff.activate()
+            pending.forEach { socket.send($0) }
+            Log.info("control channel active: independent TCP")
+        } else if ["ping", "pong", "cursor", "cursorImg"].contains(type) {
+            lastDataReceived = Date()
+            handleVideoChannelJSON(payload)
+        } else { socket.cancel() }
     }
 
     /// Make `conn` the session: replace any existing connection and reset
@@ -709,6 +823,8 @@ final class StreamReceiver: ObservableObject {
         // sender to open its own flow after hello.
         cursorConnection?.cancel()
         cursorConnection = nil
+        resetControlChannel()
+        controlToken = UUID().uuidString
         resetStreamState()
         cursorSequence.resetSession()
         cursorPortAnnounced = false
@@ -805,9 +921,7 @@ final class StreamReceiver: ObservableObject {
             guard let self, let conn = self.connection, conn.state == .ready,
                   Date().timeIntervalSince(self.lastDataReceived) > 5 else { return }
             Log.info("watchdog: nothing from the Mac for >5s — dropping connection")
-            conn.cancel()
-            self.connection = nil
-            self.setConnected(false)
+            self.endVideoSession(conn)
         }
         watchdog.resume()
         watchdogTimer = watchdog
@@ -838,6 +952,7 @@ final class StreamReceiver: ObservableObject {
             "cursorSamples": samples, "cursorPaths": cursorLatencySamples.map(\.path),
             "cursorMeanMs": mean(samples), "cursorP95Ms": percentile(samples, 0.95),
             "appSamples": appLatencySamples, "appMeanMs": mean(appLatencySamples),
+            "controlChannel": controlHandoff.phase == .dedicated ? "dedicated" : "video",
         ])
         cursorLatencySamples.removeAll(keepingCapacity: true)
         appLatencySamples.removeAll(keepingCapacity: true)
@@ -1056,6 +1171,10 @@ final class StreamReceiver: ObservableObject {
         // so a sender never dials a port nobody answers on.
         let announcesCursorPort = includeCursorPort && cursorListenerReady
         if announcesCursorPort { hello["cursorPort"] = Int(cursorPort) }
+        if includeCursorPort, connection === conn, controlListenerReady {
+            hello["controlPort"] = Int(controlPort)
+            hello["controlToken"] = controlToken
+        }
         // Additive: decode ceiling (PROTOCOL.md 6.5) — ask for the full
         // desktop but a stream no larger than this machine can decode.
         if let maxEncodeWide, let maxEncodeHigh {
@@ -1224,11 +1343,29 @@ final class StreamReceiver: ObservableObject {
 
     private func sendControl(_ message: [String: Any], on conn: NWConnection? = nil,
                              completion: (() -> Void)? = nil) {
-        guard let conn = conn ?? connection,
-              let payload = try? JSONSerialization.data(withJSONObject: message) else {
-            completion?()
-            return
+        queue.async {
+            if let conn {
+                self.sendVideoControl(message, on: conn, completion: completion)
+                return
+            }
+            guard let payload = try? JSONSerialization.data(withJSONObject: message) else { completion?(); return }
+            switch self.controlHandoff.route(payload) {
+            case .video:
+                if let connection = self.connection { self.sendVideoControl(message, on: connection, completion: completion) }
+                else { completion?() }
+            case .dedicated: self.controlSocket?.send(payload); completion?()
+            case .buffered: completion?()
+            case .overflow:
+                Log.info("control handoff buffer full — reconnecting without replay")
+                self.controlSocket?.cancel()
+                completion?()
+            }
         }
+    }
+
+    private func sendVideoControl(_ message: [String: Any], on conn: NWConnection,
+                                  completion: (() -> Void)? = nil) {
+        guard let payload = try? JSONSerialization.data(withJSONObject: message) else { completion?(); return }
         var header = UInt32(payload.count).bigEndian
         var frame = Data(bytes: &header, count: 4)
         frame.append(payload)
@@ -1239,6 +1376,14 @@ final class StreamReceiver: ObservableObject {
     }
 
     // MARK: - Socket read + length-prefixed deframing
+
+    private func endVideoSession(_ conn: NWConnection) {
+        guard connection === conn else { return }
+        connection = nil
+        resetControlChannel()
+        conn.cancel()
+        setConnected(false)
+    }
 
     private func receive(on conn: NWConnection) {
         conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
@@ -1254,11 +1399,12 @@ final class StreamReceiver: ObservableObject {
             }
             if let error {
                 Log.info("receive error: \(error)")
+                self.endVideoSession(conn)
                 return
             }
             if isComplete {
                 Log.info("peer closed connection")
-                self.setConnected(false)
+                self.endVideoSession(conn)
                 return
             }
             self.receive(on: conn)

@@ -75,6 +75,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var connection: NWConnection?
     private var virtualDisplay: VirtualDisplay?
     private let queue = DispatchQueue(label: "sender.video")
+    private var controlSocket: ControlSocket?
+    private var controlOffer: ControlChannelOffer?
+    private var controlAttemptedToken: String?
+    private var controlChannelActive = false
+    private var controlRetryAfter: TimeInterval = 0
     private let startCode: [UInt8] = [0, 0, 0, 1]
 
     // The dial target. Written on `queue` only (after init): the controller
@@ -1413,6 +1418,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // them.
         queue.async { [weak self] in
             self?.closeCursorChannel()
+            self?.closeControlChannel()
             self?.stopUpgradeProbing()
             self?.captureRecoveryWork?.cancel()
             self?.captureRecoveryWork = nil
@@ -1458,6 +1464,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.connection?.cancel()
             self.connection = nil
             self.closeCursorChannel()
+            self.closeControlChannel()
             self.stopUpgradeProbing()
             self.pendingSends = 0
             self.pipelineLock.lock()
@@ -1703,6 +1710,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Bookkeeping shared by both transports once a connection is live.
     private func becomeReady(_ conn: NWConnection) {
         Log.info("connection ready to \(endpointName)")
+        closeControlChannel()
         connectionGeneration &+= 1
         let readyGeneration = connectionGeneration
         // Per-session; the receiver rewound its floor with the connection.
@@ -2153,6 +2161,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         connection?.cancel()
         connection = nil
         closeCursorChannel()   // rebuilt from the next hello
+        closeControlChannel()
         pendingSends = 0
         pipelineLock.lock()
         pendingEncodes = 0
@@ -2465,9 +2474,71 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     // MARK: - Control messages (phone -> Mac)
 
+    private func closeControlChannel(resetAttempt: Bool = true) {
+        let old = controlSocket
+        controlSocket = nil
+        controlOffer = nil
+        controlChannelActive = false
+        if resetAttempt { controlAttemptedToken = nil }
+        old?.cancel()
+    }
+
+    private func openControlChannel(offer: ControlChannelOffer?) {
+        // The optimization is for wireless streaming. USB and legacy peers
+        // retain the existing reliable stream, including Android AOA.
+        guard !UserDefaults.standard.bool(forKey: "disableIndependentControl"),
+              ProcessInfo.processInfo.systemUptime >= controlRetryAfter,
+              case .tcp = transport, let offer, connectionReady,
+              case .hostPort(let host, _)? = connection?.currentPath?.remoteEndpoint else { return }
+        guard controlAttemptedToken != offer.token else { return }
+        closeControlChannel()
+        controlAttemptedToken = offer.token
+        controlOffer = offer
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        let params = NWParameters(tls: nil, tcp: tcp)
+        params.preferNoProxies = true
+        params.serviceClass = .responsiveData
+        let conn = NWConnection(host: host, port: NWEndpoint.Port(rawValue: offer.port)!, using: params)
+        let socket = ControlSocket(connection: conn, owner: queue,
+            onMessage: { [weak self] socket, payload in
+                guard let self, self.controlSocket === socket, self.controlChannelActive else { return }
+                guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
+                      let type = obj["type"] as? String,
+                      ["key", "text", "pointerRelative", "pointerScroll", "pointer", "inputReset",
+                       "touch", "scroll", "pencil", "proximity", "cursorAck", "cursorProbe",
+                       "latencyStats", "ping", "stats", "kf"].contains(type) else { socket.cancel(); return }
+                self.handleControl(payload)
+            }, onEnd: { [weak self] socket in
+                guard let self, self.controlSocket === socket else { return }
+                let active = self.controlChannelActive
+                // A failed side channel must not repeatedly tear down an
+                // otherwise usable headless desktop after every redial.
+                self.controlRetryAfter = ProcessInfo.processInfo.systemUptime + 30
+                self.closeControlChannel(resetAttempt: false)
+                if active {
+                    Log.info("control channel lost — reconnecting without replaying input")
+                    self.scheduleReconnect()
+                } else { Log.info("control channel unavailable — using video TCP") }
+            })
+        controlSocket = socket
+        socket.start { [weak self, weak socket] in
+            guard let self, let socket, self.controlSocket === socket else { return }
+            socket.sendJSON(["type": "controlBind", "token": offer.token])
+        }
+        queue.asyncAfter(deadline: .now() + 3) { [weak self, weak socket] in
+            guard let self, let socket, self.controlSocket === socket,
+                  !self.controlChannelActive else { return }
+            Log.info("control channel handshake timed out — using video TCP")
+            self.controlRetryAfter = ProcessInfo.processInfo.systemUptime + 30
+            self.closeControlChannel(resetAttempt: false)
+        }
+    }
+
     private func receiveControl(on conn: NWConnection) {
         conn.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
-            guard let self, error == nil, let data, data.count == 4 else {
+            guard let self, self.connection === conn else { return }
+            guard error == nil, let data, data.count == 4 else {
                 if let error {
                     Log.info("control receive ended: \(error)")
                     // A receive error on the live connection is fatal to it.
@@ -2477,16 +2548,22 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     // redial), not the link dying.
                     var isOwnCancel = false
                     if case .posix(let code) = error, code == .ECANCELED { isOwnCancel = true }
-                    if let self, self.connection === conn, !isOwnCancel {
+                    if self.connection === conn, !isOwnCancel {
                         self.linkDied("receive failed: \(error)")
                     }
+                } else if self.connection === conn, self.connectionReady {
+                    self.linkDied("control stream closed")
                 }
                 return
             }
             let len = Int(UInt32(bigEndian: data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }))
             guard len > 0, len < 1 << 20 else { return }
             conn.receive(minimumIncompleteLength: len, maximumLength: len) { [weak self] payload, _, _, error in
-                guard let self, error == nil, let payload, payload.count == len else { return }
+                guard let self, self.connection === conn else { return }
+                guard error == nil, let payload, payload.count == len else {
+                    self.linkDied("control payload ended")
+                    return
+                }
                 self.handleControl(payload)
                 self.receiveControl(on: conn)
             }
@@ -2506,6 +2583,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             return
         }
         switch type {
+        case "controlBarrier":
+            guard let offer = controlOffer, obj["token"] as? String == offer.token,
+                  let controlSocket, !controlChannelActive else { return }
+            // Every earlier event on the old upstream has now been injected.
+            controlChannelActive = true
+            controlSocket.sendJSON(["type": "controlReady", "token": offer.token])
+            Log.info("control channel active: independent TCP")
         case "cursorProbe":
             guard let id = (obj["id"] as? NSNumber)?.uint64Value else { return }
             let generation = connectionGeneration
@@ -2520,6 +2604,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         case "latencyStats":
             var report = obj
             report["quality"] = quality.rawValue
+            report["senderControlChannel"] = controlChannelActive ? "dedicated" : "video"
             cursorNetworkLock.lock()
             report["udpConfirmed"] = cursorChannelConfirmed
             cursorNetworkLock.unlock()
@@ -2567,6 +2652,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 } else {
                     closeCursorChannel()
                 }
+                openControlChannel(offer: ControlChannelOffer(port: info.controlPort, token: info.controlToken))
                 let addrs = info.addrs ?? []
                 if addrs != peerAddrs {
                     let firstHello = peerAddrs.isEmpty
@@ -3297,6 +3383,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func sendJSONFrame(_ json: String) {
         guard let connection, connectionReady else { return }
+        if controlChannelActive, let controlSocket,
+           let data = json.data(using: .utf8), data.count <= ControlFrameDecoder.maximumPayload,
+           let obj = try? JSONSerialization.jsonObject(with: data) as? [String: Any],
+           let type = obj["type"] as? String,
+           ["ping", "pong", "cursor", "cursorImg"].contains(type) {
+            controlSocket.send(data)
+            return
+        }
         sendJSONFrame(json, on: connection)
     }
 

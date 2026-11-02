@@ -720,6 +720,51 @@ change for any of this: `streamConfig` announces the stream.
 In mirror sessions `panel` only bounds the stream; the desktop is the
 sender's own display.
 
+### 6.8 Independent reliable control channel (`hello.controlPort`)
+
+An optional wireless optimization. The receiver advertises `controlPort`
+(TCP, normally video port + 2) and a fresh UUID `controlToken` only for the
+adopted video session, once the listener is ready. Provisional greetings
+MUST NOT offer it. Old senders ignore the fields; absent or unsupported
+offers retain the original video TCP control path. USB/usbmux and Android
+AOA retain that original path in the current implementation.
+
+The sender dials the same host/interface reached by video, with TCP
+`noDelay`, responsive-data service class and local proxy bypass. Frames
+are `[u32 big-endian length][JSON]`, length 1..65536. Socket I/O has its own
+serial queue, separate from video. No video data is sent on this socket.
+
+Activation preserves input ordering:
+
+1. Sender sends `{"type":"controlBind","token":"<session UUID>"}` on
+   the new socket. The receiver rejects a wrong token or an occupied slot;
+   unauthenticated candidates cannot evict an active control connection.
+2. The receiver buffers subsequent controls, then sends
+   `{"type":"controlBarrier","token":"<session UUID>"}` on the **video
+   TCP upstream**, after every input already submitted there.
+3. After processing the barrier (and all preceding input), the sender
+   answers `{"type":"controlReady","token":"<session UUID>"}` on the
+   new socket. The receiver flushes its buffer in order and routes future
+   control messages there. Buffer limits are 512 messages / 256 KiB.
+
+The dedicated upstream carries input, cursor ACKs, probes, receiver
+ping/stats and keyframe requests. Downstream it carries `ping`, `pong`,
+TCP cursor fallback and cursor sprites. Video-session greetings, stream
+configuration, power actions and lifecycle closing messages stay on video.
+The UDP cursor channel and its presentation sequence are unchanged.
+
+Before activation, a connection failure or three-second handshake timeout
+retains legacy control when safe. After the barrier, loss/overflow ends
+the session and reconnects, releasing held input on the sender. In-flight
+events MUST NOT be replayed on the other connection: whether a click was
+already injected is unknowable. The current sender suppresses new control
+dials for 30 seconds after a side-channel failure so reconnect can retain
+legacy control instead of repeatedly disrupting the desktop. A video failure also retires the control
+socket; control heartbeats must not hide a dead video connection. New video
+sessions rotate the token and discard pending input, and callbacks from
+retired sockets are ignored. Tokens bind sessions; they are unencrypted
+and do not provide device pairing or protection against network sniffing.
+
 ## 7. Coordinate spaces and units
 
 The most common third-party bug is a unit mismatch, so here is every space

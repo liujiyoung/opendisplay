@@ -31,6 +31,14 @@ class LatencyMeasurementTests(unittest.TestCase):
             with self.assertRaises(ValueError):
                 summarize([window(samples)])
 
+    def test_control_transition_or_disagreement_invalidates_run(self):
+        with self.assertRaises(ValueError):
+            summarize([window([1]), window([2], controlChannel='dedicated')])
+        with self.assertRaises(ValueError):
+            summarize([window([1], controlChannel='dedicated', senderControlChannel='video')])
+        result = summarize([window([1], controlChannel='dedicated', senderControlChannel='dedicated')])
+        self.assertEqual(result['control_channel'], 'dedicated')
+
 
 if __name__ == '__main__':
     unittest.main()

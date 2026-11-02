@@ -13,6 +13,8 @@ struct PhoneInfo: Decodable {
                           // every pre-handshake install → treat as protocol 1
     let cursorPort: Int?  // UDP port for the cursor side channel (PROTOCOL.md
                           // 6.3); absent = cursor stays on TCP
+    let controlPort: Int?
+    let controlToken: String? // optional independent TCP, scoped to this session
     let addrs: [String]?  // every address the receiver is reachable on
                           // (PROTOCOL.md 6.4); probed for a cable upgrade
     let maxEncodeWide: Int?  // receiver's decode ceiling in pixels (PROTOCOL.md

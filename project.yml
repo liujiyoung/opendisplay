@@ -173,6 +173,7 @@ targets:
       - Shared/RemoteInput.swift
       - Shared/DesktopPointer.swift
       - Shared/CursorSequenceState.swift
+      - Shared/ControlChannel.swift
       - Shared/DirectCable.swift
       - Shared/LogSnapshot.swift
       - MacReceiver/FullscreenPreference.swift
