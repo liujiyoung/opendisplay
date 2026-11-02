@@ -6,6 +6,7 @@ import GameController
 final class RemoteKeyboardView: UIView, UITextViewDelegate {
     weak var receiver: StreamReceiver?
     private var softwareKeyboard = false
+    private var forwardingEnabled = true
     private var forwardedKeys = Set<Int>()
     private let textInput = RemoteTextView()
     private var inputSourceSwitchKey = InputSourceSwitchKey()
@@ -43,7 +44,7 @@ final class RemoteKeyboardView: UIView, UITextViewDelegate {
     }
 
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
-    override var canBecomeFirstResponder: Bool { true }
+    override var canBecomeFirstResponder: Bool { forwardingEnabled }
     override var keyCommands: [UIKeyCommand]? { [] }
 
     override func becomeFirstResponder() -> Bool {
@@ -53,8 +54,20 @@ final class RemoteKeyboardView: UIView, UITextViewDelegate {
     }
 
     func focus() {
+        guard forwardingEnabled else { return }
         if softwareKeyboard { textInput.becomeFirstResponder() }
         else { becomeFirstResponder() }
+    }
+
+    func setForwardingEnabled(_ enabled: Bool) {
+        guard forwardingEnabled != enabled else { return }
+        forwardingEnabled = enabled
+        if enabled { focus() }
+        else {
+            textInput.resignFirstResponder()
+            resignFirstResponder()
+            releaseKeys()
+        }
     }
 
     func setSoftwareKeyboard(_ enabled: Bool) {
@@ -82,7 +95,7 @@ final class RemoteKeyboardView: UIView, UITextViewDelegate {
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        guard !softwareKeyboard else { super.pressesBegan(presses, with: event); return }
+        guard forwardingEnabled, !softwareKeyboard else { super.pressesBegan(presses, with: event); return }
         var local = Set<UIPress>()
         for press in presses {
             guard let key = press.key, RemoteInput.macKeyCode(forHID: key.keyCode.rawValue) != nil else {
@@ -130,7 +143,7 @@ final class RemoteKeyboardView: UIView, UITextViewDelegate {
     private func observeCapsLock() {
         // Only the focused responder owns this global callback. Retired video
         // views must not replace or clear a new view's keyboard handler.
-        guard isFirstResponder, !softwareKeyboard else { return }
+        guard forwardingEnabled, isFirstResponder, !softwareKeyboard else { return }
         rawCapsLock?.pressedChangedHandler = nil
         inputSourceSwitchKey.reset()
         let keyboard = GCKeyboard.coalesced
@@ -143,7 +156,7 @@ final class RemoteKeyboardView: UIView, UITextViewDelegate {
     }
 
     private func capsLockChanged(down: Bool) {
-        guard window != nil, isFirstResponder, !softwareKeyboard,
+        guard forwardingEnabled, window != nil, isFirstResponder, !softwareKeyboard,
               UIApplication.shared.applicationState == .active,
               receiver?.supportsRemoteInput == true else {
             inputSourceSwitchKey.reset()
@@ -155,12 +168,13 @@ final class RemoteKeyboardView: UIView, UITextViewDelegate {
     }
 
     private func tapKey(_ hid: Int) {
+        guard forwardingEnabled else { return }
         receiver?.sendKey(hid: hid, down: true)
         receiver?.sendKey(hid: hid, down: false)
     }
 
     func textViewDidChange(_ textView: UITextView) {
-        guard softwareKeyboard, textView.markedTextRange == nil, !textView.text.isEmpty else { return }
+        guard forwardingEnabled, softwareKeyboard, textView.markedTextRange == nil, !textView.text.isEmpty else { return }
         receiver?.sendText(textView.text)
         textView.text = ""
     }

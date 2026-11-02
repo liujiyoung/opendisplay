@@ -1,0 +1,7 @@
+OpenDisplay Mac login client
+
+Bundled runtime: noVNC-ARD d699293635083c9e0c30c8f9480993865653772a and noVNC 8e1ebdffba02e651c399dacef841f8941f6ad6e4.
+Source and notices: https://github.com/peetinc/noVNC-ARD and https://github.com/novnc/noVNC.
+Preferred source and OpenDisplay integration are included in this repository under ThirdParty/LoginVNC and iOS/LoginResources/login.js.
+See the accompanying license files and retained per-file notices.
+Audio, high-performance media and external network relays are not used by the login view.

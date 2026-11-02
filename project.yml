@@ -198,7 +198,11 @@ targets:
     # Anything newer is used behind #available, never as a floor.
     deploymentTarget: "15.0"
     sources:
-      - iOS
+      - path: iOS
+        excludes: ["LoginResources"]
+      - path: iOS/LoginResources
+        type: folder
+        buildPhase: resources
       - Shared
     info:
       path: iOS/Info.plist

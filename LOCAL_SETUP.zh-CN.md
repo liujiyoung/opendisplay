@@ -14,7 +14,7 @@
 - 从 SSH 等应用返回前台时重新绑定触控板，核对当前场景的实际指针锁状态；触控板输入配置变更或临时丢锁时尝试恢复。诊断日志中的 `pointer input` 仅记录原始/已转发事件数量和捕获状态，不记录按键文字或屏幕内容。
 - Mac 可通过用户级 LaunchAgent 在登录后自动启动、保持单实例，并在退出后重启。
 
-已在 M4 Mac mini 与 11 英寸 M1 iPad Pro / 苹果妙控键盘上验证画面、键盘、触控板和输入法。USB 使用 2388×1668 HEVC，流内统计通常约 60 fps；该统计不是完整输入到光子的硬件延迟测量。180 项 Mac 测试及 2 项 iPad UIKit 回归测试覆盖跨屏坐标、拖动后的双击状态、视频布局、硬件键盘输入、Caps Lock 单次触发和修饰键过滤，以及控制通道的分帧、顺序屏障与真实 TCP 消息顺序。
+已在 M4 Mac mini 与 11 英寸 M1 iPad Pro / 苹果妙控键盘上验证画面、键盘、触控板和输入法。USB 使用 2388×1668 HEVC，流内统计通常约 60 fps；该统计不是完整输入到光子的硬件延迟测量。180 项 Mac 测试及 5 项 iPad UIKit 回归测试覆盖跨屏坐标、拖动后的双击状态、视频布局、硬件键盘输入、Caps Lock 单次触发和修饰键过滤，以及控制通道的分帧、顺序屏障与真实 TCP 消息顺序；iPad 测试另覆盖登录客户端离线初始化、分段 Apple RFB 握手和普通传屏键盘的隔离。
 
 已实测：拔掉 Mac 外接显示器后，可仅用 iPad 经 Wi-Fi 显示和控制；在此无显示器状态下，Wi-Fi → USB → Wi-Fi 自动切换正常。无外接显示器时正常退出发送端，LaunchAgent 能自动拉起应用、创建虚拟显示器并重连 Wi-Fi。以上是已登录图形会话内的测试，不能替代冷启动验收。
 
@@ -210,13 +210,39 @@ python3 tools/local/login.py install
 
 ## 无头启动的边界
 
-此启动项属于当前用户的 Aqua 图形会话：**用户登录后自启动，不是 FileVault 解锁前的系统服务。** 只有 SSH shell 登录并不等于已建立图形登录会话。FileVault 等待解锁、停留在登录窗口且用户会话尚未建立时，OpenDisplay 不能提供登录画面，也不能靠 iPad 中的 OpenDisplay 自行完成开机解锁。
+此启动项属于当前用户的 Aqua 图形会话：**用户登录后自启动，不是 FileVault 解锁前的系统服务。** 只有 SSH shell 登录并不等于已建立图形登录会话。默认传屏通道依赖该会话；新增的 iPad「Mac 登录」入口改用系统屏幕共享连接登录窗口，但仍须先通过 SSH 解锁 FileVault，不能直接解锁尚未挂载的数据卷。
 
 先确认 iPad 的画面和输入正常，再断开原显示器的视频连接，验证 iPad 成为唯一显示器。第一次验收时保留恢复用的显示器和键盘。
 
 Apple 文档说明：Apple 芯片 Mac 在 macOS 26 及以上、开启 Remote Login 且网络可用时，可通过 SSH 解锁 FileVault。见 [Apple 官方说明](https://support.apple.com/en-ca/guide/security/sec8447f5049/web)。是否能在具体网络的预启动环境连通，以及解锁后能否恢复用户会话，需要单独实测；此分支不会关闭 FileVault 或自动设置登录。
 
-保留 FileVault 时，可先在 iPad 的 SSH 客户端配置 Mac 的局域网地址、端口 22、允许解锁 FileVault 的本地用户名，以及**密码认证**。先在正常运行时验证登录，再安排重启测试；密码仅在 SSH 客户端中输入。预启动阶段无法使用数据卷里的普通 SSH 密钥认证配置。成功解锁后 SSH 会暂时断开，等待 macOS 启动，再打开 iPad 的 OpenDisplay。若用户图形会话仍未建立，须先完成图形登录；不要把 SSH shell 登录视为图形登录。预启动可用网络条件见 [Apple FileVault 网络要求](https://support.apple.com/guide/deployment/dep82064ec40/web)。
+保留 FileVault 时，可先在 iPad 的 SSH 客户端配置 Mac 的局域网地址、端口 22、允许解锁 FileVault 的本地用户名，以及**密码认证**。先在正常运行时验证登录，再安排重启测试；密码仅在 SSH 客户端中输入。预启动阶段无法使用数据卷里的普通 SSH 密钥认证配置。预启动可用网络条件见 [Apple FileVault 网络要求](https://support.apple.com/guide/deployment/dep82064ec40/web)。
+
+### SSH 解锁磁盘与登录桌面是两步
+
+SSH 解锁 FileVault 的动作发生在**密码认证时**，不需要进入 shell 后再运行某条解锁命令。Apple 随系统提供的 `man apple_ssh_and_filevault` 明确说明：解锁后 SSH 会短暂断开，系统挂载数据卷并启动其余服务，随后才恢复普通 SSH 会话。也可阅读 [Apple 发布的同一手册](https://github.com/apple-oss-distributions/OpenSSH/blob/main/apple_ssh_and_filevault.7)。
+
+如果已经看到 `jiyang@…` 一类 shell 提示符，说明数据卷已经可用；继续输入 `login`、`sudo -i` 或重新 SSH 不会替代图形桌面登录。此时可在 iPad 的 SSH 命令行中只读检查：
+
+```sh
+stat -f '%Su' /dev/console
+```
+
+- 输出为 `root` 或 `loginwindow` 等系统账户：通常尚未建立用户的控制台图形会话，OpenDisplay 的 Aqua 启动项不能运行。
+- 输出为自己的用户名：已有该用户的控制台会话，但仍可能锁屏；若 OpenDisplay 没画面，应继续检查应用、捕获权限和连接状态，不能再归因于 FileVault。
+
+macOS 未提供这里可直接使用的通用 SSH 图形登录命令。为满足仅使用现有 SSH 客户端和 OpenDisplay 的要求，iPad 接收端增加「Mac 登录」入口，不依赖另装远程桌面应用。保留 FileVault 的恢复路径为：
+
+1. 在 iPad 通过 SSH 密码认证解锁磁盘；若连接短暂断开，等待系统启动。
+2. 回到 iPad 的 OpenDisplay，在等待连接页点**Mac 登录**，填写 Mac 的局域网 IP 或 `.local` 名称、用户名和 Mac 登录密码，点「连接登录画面」。连接使用系统屏幕共享固定端口 `5900`，即使发送端尚未启动也可独立建立。
+3. 在显示的 Mac 登录窗口完成同一用户的图形登录。若屏幕共享认证后仍显示密码框，需要在画面中再次输入；底部提供 Tab、Return 和 Esc 按钮。连接共享控制台，不另建后台用户会话。
+4. 登录后，OpenDisplay 的用户启动项运行并恢复原有视频连接，iPad 会关闭登录入口，返回传屏。也可点「返回 OpenDisplay」手动关闭。当前已在传屏时，可三指轻点 iPad 屏幕，展开右上工具条，在 **Mac → Mac 登录** 中测试入口。
+
+Mac 端路径是「系统设置 → 通用 → 共享 → 屏幕共享」，仅允许需要的账户访问；不需要另开匿名控制或单独的传统 VNC 密码。登录入口使用离线打包的 noVNC / noVNC-ARD 开源代码，来源、固定提交与许可证在 `ThirdParty/LoginVNC`。所有网络字节通过应用自己的直连 TCP 连接传送，不加载远程网页、CDN 或中转服务，也不增加 Mac 常驻服务。
+
+界面只保存地址和用户名；密码不存入配置、Keychain、URL 或日志。WebKit 使用临时数据存储，退出登录入口或切出应用时断开并清除本次凭据。登录界面出现时暂停普通传屏的键盘转发和相对触控板捕获；登录通道确认完整加密后才允许远端输入。
+
+本机已只读确认屏幕共享、远程登录和所需账户访问权限已开启，且屏幕共享能响应协议协商；没有为此改变权限、关闭 FileVault 或设置自动登录。**iPad 实体机认证、冷启动后首次图形登录，以及登录后交接 OpenDisplay 仍待实机验收。** 当前已登录状态下的检查不能替代该验收。
 
 ## 协议扩展
 

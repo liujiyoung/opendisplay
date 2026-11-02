@@ -75,6 +75,7 @@ struct ReceiverScreen: View {
     @State private var nagDismissed = false
     @State private var showSoftwareKeyboard = false
     @State private var showRemoteTools = false
+    @State private var showMacLogin = false
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
     // First-run onboarding (issue #49): explain the Mac app is required.
@@ -89,7 +90,7 @@ struct ReceiverScreen: View {
 
     private var shouldCapturePointer: Bool {
         isStreaming && model.receiver.supportsRelativePointer
-            && !showRemoteTools && !showSettings && !showSoftwareKeyboard
+            && !showRemoteTools && !showSettings && !showSoftwareKeyboard && !showMacLogin
             && UIApplication.shared.applicationState == .active
     }
 
@@ -117,6 +118,7 @@ struct ReceiverScreen: View {
                                    receiver: model.receiver,
                                    useMetal: metalRenderer,
                                    softwareKeyboard: showSoftwareKeyboard,
+                                   inputEnabled: !showMacLogin,
                                    pointerCapture: pointerCapture,
                                    onToggleTools: {
                                        withAnimation(.easeInOut(duration: 0.15)) {
@@ -139,6 +141,7 @@ struct ReceiverScreen: View {
                                         model.receiver.sendKey(hid: 43, down: false)
                                     }
                                     Menu("Mac") {
+                                        Button("Mac 登录") { showMacLogin = true }
                                         Button("Switch input source (Control-Space)") {
                                             model.receiver.sendShortcut(hid: 44, modifierHID: 224)
                                         }
@@ -187,7 +190,8 @@ struct ReceiverScreen: View {
                         .allowsHitTesting(false)   // never block touch input
                     }
                 } else {
-                    IdleView(receiver: model.receiver, showSettings: $showSettings)
+                    IdleView(receiver: model.receiver, showSettings: $showSettings,
+                             showMacLogin: $showMacLogin)
                 }
             }
             // The window, not this view: a sheet, the keyboard or the
@@ -202,6 +206,12 @@ struct ReceiverScreen: View {
         .systemOverlaysHidden(isStreaming)
         .sheet(isPresented: $showSettings) {
             SettingsView(receiver: model.receiver)
+        }
+        .fullScreenCover(isPresented: $showMacLogin) {
+            MacLoginView()
+        }
+        .onChange(of: isStreaming) { streaming in
+            if streaming { showMacLogin = false }
         }
         // Below the force floor → blocking gate. Setter is a no-op: the user
         // cannot dismiss it, only update.
@@ -286,6 +296,7 @@ struct ReceiverScreen: View {
 struct IdleView: View {
     @ObservedObject var receiver: StreamReceiver
     @Binding var showSettings: Bool
+    @Binding var showMacLogin: Bool
 
     var body: some View {
         VStack(spacing: 28) {
@@ -324,6 +335,14 @@ struct IdleView: View {
                         in: RoundedRectangle(cornerRadius: 16))
 
             Spacer()
+
+            Button {
+                showMacLogin = true
+            } label: {
+                Label("Mac 登录", systemImage: "lock.open")
+            }
+            .buttonStyle(.borderedProminent)
+            .accessibilityIdentifier("openMacLogin")
 
             Button {
                 showSettings = true
@@ -881,6 +900,7 @@ struct VideoLayerView: UIViewRepresentable {
     let receiver: StreamReceiver
     let useMetal: Bool
     let softwareKeyboard: Bool
+    let inputEnabled: Bool
     let pointerCapture: RelativePointerCapture
     let onToggleTools: () -> Void
 
@@ -893,6 +913,7 @@ struct VideoLayerView: UIViewRepresentable {
         view.pointerCapture = pointerCapture
         view.onToggleTools = onToggleTools
         view.keyboardInput.receiver = receiver
+        view.keyboardInput.setForwardingEnabled(inputEnabled)
         view.addSubview(view.keyboardInput)
         view.keyboardInput.frame = CGRect(x: 0, y: 0, width: 1, height: 1)
 
@@ -968,6 +989,7 @@ struct VideoLayerView: UIViewRepresentable {
         uiView.onToggleTools = onToggleTools
         uiView.pointerCapture = pointerCapture
         uiView.keyboardInput.setSoftwareKeyboard(softwareKeyboard)
+        uiView.keyboardInput.setForwardingEnabled(inputEnabled)
     }
 
     final class VideoView: UIView {
