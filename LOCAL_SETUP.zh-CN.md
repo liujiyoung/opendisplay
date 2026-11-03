@@ -11,14 +11,15 @@
 - 工具条默认完全隐藏；三指轻点 **iPad 屏幕** 显示或收起。展开后位于右上方，也可点 × 关闭，避免遮住 Dock。
 - 工具条提供 Esc、Tab、Mac 快捷键菜单，以及可选的 iPad 文本输入模式。部分组合键由 iPadOS 保留，可从 Mac 菜单发送切换输入法、切换应用、复制和粘贴。
 - 断线、应用进入后台或输入焦点离开时释放远端按键和鼠标按钮。
+- 针对 iPad Command+Tab 返回后单击 Dock 被当成 Command-click 的问题，在按键取消、场景失活和恢复时清理输入；相对移动、点按和滚动携带当前硬件修饰键状态，Mac 在派发前释放过期的远程修饰键。此修正版已安装，实体机往返切换验收待确认。
 - 从 SSH 等应用返回前台时重新绑定触控板，核对当前场景的实际指针锁状态；触控板输入配置变更或临时丢锁时尝试恢复。诊断日志中的 `pointer input` 仅记录原始/已转发事件数量和捕获状态，不记录按键文字或屏幕内容。
 - Mac 可通过用户级 LaunchAgent 在登录后自动启动、保持单实例，并在退出后重启。
 
-已在 M4 Mac mini 与 11 英寸 M1 iPad Pro / 苹果妙控键盘上验证画面、键盘、触控板和输入法。USB 使用 2388×1668 HEVC，流内统计通常约 60 fps；该统计不是完整输入到光子的硬件延迟测量。180 项 Mac 测试及 5 项 iPad UIKit 回归测试覆盖跨屏坐标、拖动后的双击状态、视频布局、硬件键盘输入、Caps Lock 单次触发和修饰键过滤，以及控制通道的分帧、顺序屏障与真实 TCP 消息顺序；iPad 测试另覆盖登录客户端离线初始化、分段 Apple RFB 握手和普通传屏键盘的隔离。
+已在 M4 Mac mini 与 11 英寸 M1 iPad Pro / 苹果妙控键盘上验证画面、键盘、触控板和输入法。USB 使用 2388×1668 HEVC，流内统计通常约 60 fps；该统计不是完整输入到光子的硬件延迟测量。184 项 Mac 测试及 5 项 iPad UIKit 回归测试覆盖跨屏坐标、拖动后的双击状态、视频布局、硬件键盘输入、Caps Lock 单次触发和修饰键过滤、Command-Tab 后的远程修饰键释放，以及控制通道的分帧、顺序屏障与真实 TCP 消息顺序；iPad 测试另覆盖登录客户端离线初始化、分段 Apple RFB 握手和普通传屏键盘的隔离。
 
 已实测：拔掉 Mac 外接显示器后，可仅用 iPad 经 Wi-Fi 显示和控制；在此无显示器状态下，Wi-Fi → USB → Wi-Fi 自动切换正常。无外接显示器时正常退出发送端，LaunchAgent 能自动拉起应用、创建虚拟显示器并重连 Wi-Fi。以上是已登录图形会话内的测试，不能替代冷启动验收。
 
-**冷启动、FileVault 预启动解锁、普通锁屏恢复及所有布局/快捷键组合尚未全部验收。** 自动启动项在用户登录后运行，不能替代登录前的画面和解锁步骤。
+**当前随身 Wi-Fi 环境的冷启动验收失败：输入 Mac 密码前 Wi-Fi 未连接，iPad SSH 不可达；本地输入密码后才联网。** FileVault 预启动联网问题仍待解决；普通锁屏恢复及所有布局/快捷键组合尚未全部验收。自动启动项在用户登录后运行，不能替代登录前的画面和解锁步骤。
 
 ## 连接方式
 
@@ -218,6 +219,8 @@ Apple 文档说明：Apple 芯片 Mac 在 macOS 26 及以上、开启 Remote Log
 
 保留 FileVault 时，可先在 iPad 的 SSH 客户端配置 Mac 的局域网地址、端口 22、允许解锁 FileVault 的本地用户名，以及**密码认证**。先在正常运行时验证登录，再安排重启测试；密码仅在 SSH 客户端中输入。预启动阶段无法使用数据卷里的普通 SSH 密钥认证配置。预启动可用网络条件见 [Apple FileVault 网络要求](https://support.apple.com/guide/deployment/dep82064ec40/web)。
 
+2026-11-03 用户冷启动实测停在联网之前：Mac 密码界面 Wi-Fi 未连接，iPad 无法 SSH；输入本地 Mac 密码后才联网。正常系统中已确认该网络的「自动加入」开启；系统报告加密模式为 WPA2/WPA3 Personal 混合。Apple 的预启动网络要求明确列出已加入的 WPA2-PSK 网络，以及无需认证的以太网。混合模式的预启动兼容性是待验证因素，尚不能据此认定为唯一根因。可在用户确认后对照测试 WPA2-Personal/AES，或用 Mac 原生以太网接同一局域网；改变加密模式会影响所有无线客户端，不能为排障直接关闭加密。此处没有改动路由器安全设置，也没有关闭 FileVault。
+
 ### SSH 解锁磁盘与登录桌面是两步
 
 SSH 解锁 FileVault 的动作发生在**密码认证时**，不需要进入 shell 后再运行某条解锁命令。Apple 随系统提供的 `man apple_ssh_and_filevault` 明确说明：解锁后 SSH 会短暂断开，系统挂载数据卷并启动其余服务，随后才恢复普通 SSH 会话。也可阅读 [Apple 发布的同一手册](https://github.com/apple-oss-distributions/OpenSSH/blob/main/apple_ssh_and_filevault.7)。
@@ -263,7 +266,7 @@ Mac 端路径是「系统设置 → 通用 → 共享 → 屏幕共享」，仅�
 | text | 已提交的 Unicode 文本 |
 | pointer | phase=down/move/up、归一化 x/y、button=0/1/2、clicks、modifiers |
 | pointerRelative | 能力 2；phase=down/move/up、dx/dy（Mac 全局桌面点，向右/向下为正）、button、clicks、modifiers |
-| pointerScroll | 能力 2；dx/dy 滚动量，在 Mac 当前光标位置派发，不把光标移回 iPad |
-| inputReset | 释放会话持有的按键和鼠标按钮 |
+| pointerScroll | 能力 2；dx/dy 滚动量、可选 modifiers 当前快照，在 Mac 当前光标位置派发，不把光标移回 iPad；旧接收端省略时保留此前远程修饰键状态 |
+| inputReset | 释放会话持有的按键、修饰键标志和鼠标按钮，包括没有显式 modifier key-down 的远程标志 |
 
 修饰键仅允许 caps、shift、control、option、command、keypad、fn。原有 touch、scroll、pencil 路径保持兼容。完整新增输入功能需要配套使用本分支的 Mac 和 iPad 应用。

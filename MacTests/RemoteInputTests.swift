@@ -43,6 +43,49 @@ final class RemoteInputTests: XCTestCase {
     }
 }
 
+final class RemoteModifierStateTests: XCTestCase {
+    private let command: UInt64 = 1 << 20
+    private let shift: UInt64 = 1 << 17
+
+    func testResetReleasesFlagsEvenWithoutAnExplicitModifierKeyDown() {
+        var state = RemoteModifierState()
+        state.observe(command)
+        XCTAssertEqual(state.releaseAll(heldKeys: []), [55])
+        XCTAssertEqual(state.flags, 0)
+        XCTAssertEqual(state.releaseAll(heldKeys: []), [])
+    }
+
+    func testCommandTabReturnCannotLeaveACommandClickAfterReset() {
+        var state = RemoteModifierState()
+        state.observe(command)
+        XCTAssertEqual(state.releaseAll(heldKeys: [55, 48]), [48, 55])
+        // A late event carrying Command can arrive after the first reset.
+        state.observe(command)
+        XCTAssertEqual(state.reconcile(to: 0, heldKeys: []), [55])
+        XCTAssertEqual(state.flags, 0)
+        XCTAssertEqual(state.reconcile(to: 0, heldKeys: []), [])
+    }
+
+    func testPhysicalCommandHoldAndBothCommandKeysArePreservedUntilRelease() {
+        var state = RemoteModifierState()
+        state.observe(command | shift)
+        XCTAssertEqual(state.reconcile(to: command | shift, heldKeys: [54, 55, 56]), [])
+        XCTAssertEqual(state.reconcile(to: shift, heldKeys: [54, 55, 56]), [54, 55])
+        XCTAssertEqual(state.flags, shift)
+        XCTAssertEqual(state.reconcile(to: 0, heldKeys: [56]), [56])
+    }
+
+    func testLivePointerSnapshotOverridesAStaleCommandFlag() {
+        let observed = Set(224...231)
+        XCTAssertEqual(RemoteInput.pointerModifiers(fallback: command, observedHIDs: observed, pressedHIDs: []), 0)
+        XCTAssertEqual(RemoteInput.pointerModifiers(fallback: 0, observedHIDs: observed, pressedHIDs: [231]), command)
+        XCTAssertEqual(RemoteInput.pointerModifiers(fallback: 1 << 16, observedHIDs: observed,
+                                                   pressedHIDs: [225, 227]), shift | command)
+        // Without a raw keyboard, UIKit remains the fallback.
+        XCTAssertEqual(RemoteInput.pointerModifiers(fallback: command, observedHIDs: [], pressedHIDs: []), command)
+    }
+}
+
 final class RemoteCapsLockStateTests: XCTestCase {
     func testDefaultControlsCaseOncePerPhysicalPress() {
         var state = RemoteCapsLockState()

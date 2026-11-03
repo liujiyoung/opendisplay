@@ -1319,15 +1319,17 @@ final class StreamReceiver: ObservableObject {
     }
 
     func sendRelativePointer(phase: String, dx: Double = 0, dy: Double = 0,
-                             button: Int = 0, clicks: Int = 1) {
+                             button: Int = 0, clicks: Int = 1, modifiers: UInt64? = nil) {
         guard supportsRelativePointer else { return }
+        if let modifiers { remoteModifiers = RemoteInput.iPadModifiers(modifiers) }
         sendControl(["type": "pointerRelative", "phase": phase, "dx": dx, "dy": dy,
                      "button": button, "clicks": clicks, "modifiers": remoteModifiers])
     }
 
-    func sendPointerScroll(dx: Double, dy: Double) {
+    func sendPointerScroll(dx: Double, dy: Double, modifiers: UInt64? = nil) {
         guard supportsRelativePointer else { return }
-        sendControl(["type": "pointerScroll", "dx": dx, "dy": dy])
+        if let modifiers { remoteModifiers = RemoteInput.iPadModifiers(modifiers) }
+        sendControl(["type": "pointerScroll", "dx": dx, "dy": dy, "modifiers": remoteModifiers])
     }
 
     /// Two-finger scroll: dx/dy in video pixels (natural-scrolling sign).

@@ -33,6 +33,7 @@ final class InputInjector {
     // composited on the display (visible in the stream, unclickable).
     private let source = CGEventSource(stateID: .hidSystemState)
     private var heldKeys = Set<CGKeyCode>()
+    private var modifierState = RemoteModifierState()
     private var heldPointerButtons = Set<Int>()
 
     deinit { releaseRemoteInput() }
@@ -45,6 +46,7 @@ final class InputInjector {
         guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: down) else { return }
         if (224...231).contains(hid) || hid == 57 { event.type = .flagsChanged }
         event.flags = CGEventFlags(rawValue: modifiers & RemoteInput.modifierMask)
+        modifierState.observe(modifiers)
         event.setIntegerValueField(.keyboardEventAutorepeat, value: repeated ? 1 : 0)
         event.post(tap: .cghidEventTap)
     }
@@ -96,6 +98,7 @@ final class InputInjector {
 
     private func postPointer(phase: String, at p: CGPoint, button: Int,
                              clicks: Int, modifiers: UInt64) {
+        reconcileModifierReleases(modifiers)
         let origin = currentCursor()
         let effectiveButton = phase == "move" ? (heldPointerButtons.sorted().first ?? button) : button
         let mouseButton: CGMouseButton = effectiveButton == 1 ? .right : effectiveButton == 2 ? .center : .left
@@ -123,20 +126,35 @@ final class InputInjector {
     }
 
     /// Pointer scrolling follows the cursor on whichever display currently owns it.
-    func handlePointerScroll(dx: Double, dy: Double) {
+    func handlePointerScroll(dx: Double, dy: Double, modifiers: UInt64? = nil) {
+        // Old receivers omit the additive snapshot; retain their existing
+        // remote keyboard state instead of treating omission as key release.
+        let flags = modifiers ?? modifierState.flags
+        reconcileModifierReleases(flags)
         guard dx.isFinite, dy.isFinite, abs(dx) <= 4096, abs(dy) <= 4096,
               let event = CGEvent(scrollWheelEvent2Source: source, units: .pixel, wheelCount: 2,
                                   wheel1: Int32(dy.rounded()), wheel2: Int32(dx.rounded()), wheel3: 0)
         else { return }
         event.location = currentCursor()
+        event.flags = CGEventFlags(rawValue: flags & RemoteInput.modifierMask)
         event.post(tap: .cghidEventTap)
+    }
+
+    private func reconcileModifierReleases(_ flags: UInt64) {
+        for code in modifierState.reconcile(to: flags, heldKeys: heldKeys) {
+            heldKeys.remove(code)
+            guard let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false) else { continue }
+            event.type = .flagsChanged
+            event.flags = CGEventFlags(rawValue: flags & RemoteInput.modifierMask)
+            event.post(tap: .cghidEventTap)
+        }
     }
 
     /// A cable loss or backgrounded iPad must never leave Command or a drag held.
     func releaseRemoteInput() {
-        for code in heldKeys {
+        for code in modifierState.releaseAll(heldKeys: heldKeys) {
             if let event = CGEvent(keyboardEventSource: source, virtualKey: code, keyDown: false) {
-                if [54, 55, 56, 57, 58, 59, 60, 61, 62].contains(code) { event.type = .flagsChanged }
+                if [54, 55, 56, 57, 58, 59, 60, 61, 62, 63].contains(code) { event.type = .flagsChanged }
                 event.flags = []
                 event.post(tap: .cghidEventTap)
             }

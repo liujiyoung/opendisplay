@@ -118,7 +118,7 @@ struct ReceiverScreen: View {
                                    receiver: model.receiver,
                                    useMetal: metalRenderer,
                                    softwareKeyboard: showSoftwareKeyboard,
-                                   inputEnabled: !showMacLogin,
+                                   inputEnabled: !showMacLogin && !showSettings,
                                    pointerCapture: pointerCapture,
                                    onToggleTools: {
                                        withAnimation(.easeInOut(duration: 0.15)) {
@@ -784,6 +784,7 @@ final class ReceiverModel: ObservableObject {
     }
 
     func sceneDidActivate() {
+        receiver.resetRemoteInput()
         endBackgroundAssertion()
         receiver.setRenderingPaused(false)
         // A fold while the app was in the background: announce the screen it
@@ -1234,7 +1235,9 @@ struct VideoLayerView: UIViewRepresentable {
             case .changed:
                 let translation = recognizer.translation(in: self)
                 receiver?.sendPointerScroll(dx: translation.x - lastPointerScroll.x,
-                                             dy: translation.y - lastPointerScroll.y)
+                                             dy: translation.y - lastPointerScroll.y,
+                                             modifiers: RemoteKeyboardView.pointerModifiers(
+                                                fallback: UInt64(recognizer.modifierFlags.rawValue)))
                 lastPointerScroll = translation
             default: lastPointerScroll = .zero
             }

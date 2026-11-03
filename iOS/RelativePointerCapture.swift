@@ -22,7 +22,10 @@ final class RelativePointerCapture: ObservableObject {
         }
     }
     var wantsLock: Bool { enabled && hasMouse }
-    var isCapturing: Bool { wantsLock && locked }
+    var isCapturing: Bool {
+        wantsLock && locked && UIApplication.shared.applicationState == .active
+            && observedScene?.activationState == .foregroundActive
+    }
 
     private var mice: [ObjectIdentifier: GCMouse] = [:]
     private var mouseInputs: [ObjectIdentifier: GCMouseInput] = [:]
@@ -173,7 +176,8 @@ final class RelativePointerCapture: ObservableObject {
         if !loggedMotion { Log.info("relative pointer input active"); loggedMotion = true }
         travel.x += dx
         travel.y += dy
-        receiver?.sendRelativePointer(phase: "move", dx: dx, dy: dy)
+        receiver?.sendRelativePointer(phase: "move", dx: dx, dy: dy,
+            modifiers: RemoteKeyboardView.pointerModifiers(fallback: receiver?.remoteModifiers ?? 0))
     }
 
     private func button(_ button: Int, down: Bool) {
@@ -181,7 +185,8 @@ final class RelativePointerCapture: ObservableObject {
         let time = ProcessInfo.processInfo.systemUptime
         let count = down ? clicks.down(button: button, time: time, point: travel)
             : clicks.up(button: button, time: time, point: travel)
-        receiver?.sendRelativePointer(phase: down ? "down" : "up", button: button, clicks: count)
+        receiver?.sendRelativePointer(phase: down ? "down" : "up", button: button, clicks: count,
+            modifiers: RemoteKeyboardView.pointerModifiers(fallback: receiver?.remoteModifiers ?? 0))
     }
 }
 

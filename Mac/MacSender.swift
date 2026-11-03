@@ -2763,7 +2763,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         case "pointerScroll":
             if let dx = obj["dx"] as? Double, let dy = obj["dy"] as? Double {
-                inputInjector?.handlePointerScroll(dx: dx, dy: dy)
+                inputInjector?.handlePointerScroll(dx: dx, dy: dy,
+                    modifiers: (obj["modifiers"] as? UInt64).map { remoteCapsLock.modifiers($0) })
             }
         case "pointer":
             if let phase = obj["phase"] as? String,

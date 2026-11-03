@@ -787,6 +787,29 @@ Control-Space fallback. Earlier receivers that already converted Caps Lock to
 Control-Space need updating to use the sender's new choice: their shortcut is
 indistinguishable from an intentional Control-Space chord.
 
+### 6.10 Remote input modifier recovery
+
+For senders advertising `remoteInput: 2`, `pointerRelative` includes a
+`modifiers` snapshot and `pointerScroll` may include the same optional field.
+These are macOS event-flag bits, masked to supported modifiers. Updated iPad
+receivers read the current hardware keyboard state for Control, Shift, Option
+and Command before sending relative motion, clicks or scrolling; UIKit flags
+remain the fallback when raw keyboard state is unavailable. iPad Caps Lock
+does not override the sender's remote case preference (section 6.9).
+
+Before injecting a pointer event, the sender releases remote modifiers absent
+from that snapshot. It tracks flags asserted by ordinary remote events as well
+as explicit modifier key-downs, so `inputReset` also releases modifiers whose
+matching key-down was never received. Releases are limited to this session's
+state, not inferred from the Mac's global physical keyboard state. For an older
+receiver omitting scroll modifiers, the sender preserves its last remote flags.
+Older senders ignore the additive scroll field.
+
+The iPad receiver sends `inputReset` on press cancellation, scene deactivation
+and reactivation, clears its local forwarded-key cache, and ignores late key-up
+events from an inactive scene. This prevents an iPadOS-owned Command-Tab from
+leaving a subsequent plain click interpreted as Command-click on the Mac.
+
 ## 7. Coordinate spaces and units
 
 The most common third-party bug is a unit mismatch, so here is every space

@@ -14,6 +14,21 @@ enum RemoteInput {
         flags & modifierMask & ~(1 << 16)
     }
 
+    /// Raw pointer events have no UIKit modifier flags. Prefer the current
+    /// physical keyboard snapshot over the last key event's cached flags.
+    static func pointerModifiers(fallback: UInt64, observedHIDs: Set<Int>, pressedHIDs: Set<Int>) -> UInt64 {
+        var flags = iPadModifiers(fallback)
+        let groups: [(UInt64, Set<Int>)] = [
+            (1 << 18, [224, 228]), (1 << 17, [225, 229]),
+            (1 << 19, [226, 230]), (1 << 20, [227, 231]),
+        ]
+        for (mask, hids) in groups where !hids.isDisjoint(with: observedHIDs) {
+            flags &= ~mask
+            if !hids.isDisjoint(with: pressedHIDs) { flags |= mask }
+        }
+        return flags
+    }
+
     static func macKeyCode(forHID usage: Int) -> UInt16? { keyCodes[usage] }
 
     private static let keyCodes: [Int: UInt16] = [
@@ -45,6 +60,42 @@ enum RemoteInput {
         }
         if !chunk.isEmpty { result.append(chunk) }
         return result
+    }
+}
+
+/// The last injected flags can outlive their key-down (for example after an
+/// app-switch reset followed by a delayed event). Release only modifiers owned
+/// by this remote session, never infer ownership from the Mac's global state.
+struct RemoteModifierState {
+    private(set) var flags: UInt64 = 0
+    private static let keys: [(UInt64, [UInt16])] = [
+        (1 << 17, [56, 60]), // Shift
+        (1 << 18, [59, 62]), // Control
+        (1 << 19, [58, 61]), // Option
+        (1 << 20, [55, 54]), // Command
+        (1 << 23, [63]),     // Fn
+    ]
+
+    mutating func observe(_ flags: UInt64) {
+        self.flags = flags & RemoteInput.modifierMask
+    }
+
+    mutating func reconcile(to desired: UInt64, heldKeys: Set<UInt16>) -> [UInt16] {
+        let desired = desired & RemoteInput.modifierMask
+        var releases = Set<UInt16>()
+        for (mask, codes) in Self.keys where desired & mask == 0 {
+            let held = heldKeys.intersection(codes)
+            releases.formUnion(held)
+            // A flag-bearing ordinary key or mouse event may have asserted
+            // the modifier without a matching explicit modifier key-down.
+            if flags & mask != 0, held.isEmpty { releases.insert(codes[0]) }
+        }
+        flags = desired
+        return releases.sorted()
+    }
+
+    mutating func releaseAll(heldKeys: Set<UInt16>) -> [UInt16] {
+        Array(heldKeys.union(reconcile(to: 0, heldKeys: heldKeys))).sorted()
     }
 }
 

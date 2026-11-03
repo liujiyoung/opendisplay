@@ -34,7 +34,21 @@ final class RemoteKeyboardView: UIView, UITextViewDelegate {
             keyboardObservers.append(NotificationCenter.default.addObserver(
                 forName: name, object: nil, queue: .main
             ) { [weak self] _ in
-                DispatchQueue.main.async { self?.observeCapsLock() }
+                DispatchQueue.main.async { self?.releaseKeys(); self?.observeCapsLock() }
+            })
+        }
+        for name in [UIApplication.willResignActiveNotification, UIApplication.didEnterBackgroundNotification,
+                     UIApplication.didBecomeActiveNotification, UIScene.willDeactivateNotification,
+                     UIScene.didActivateNotification] {
+            keyboardObservers.append(NotificationCenter.default.addObserver(
+                forName: name, object: nil, queue: .main
+            ) { [weak self] note in
+                guard let self else { return }
+                if let scene = note.object as? UIScene, scene !== self.window?.windowScene { return }
+                self.releaseKeys()
+                if name == UIApplication.didBecomeActiveNotification || name == UIScene.didActivateNotification {
+                    if self.inputSceneIsActive { self.focus() }
+                }
             })
         }
     }
@@ -46,6 +60,28 @@ final class RemoteKeyboardView: UIView, UITextViewDelegate {
     required init?(coder: NSCoder) { fatalError("init(coder:) has not been implemented") }
     override var canBecomeFirstResponder: Bool { forwardingEnabled }
     override var keyCommands: [UIKeyCommand]? { [] }
+
+    private var inputSceneIsActive: Bool {
+        UIApplication.shared.applicationState == .active
+            && window?.windowScene?.activationState == .foregroundActive
+    }
+
+    static func pointerModifiers(fallback: UInt64) -> UInt64 {
+        guard let keyboard = GCKeyboard.coalesced?.keyboardInput else {
+            return RemoteInput.iPadModifiers(fallback)
+        }
+        let keys: [(GCKeyCode, Int)] = [
+            (.leftControl, 224), (.leftShift, 225), (.leftAlt, 226), (.leftGUI, 227),
+            (.rightControl, 228), (.rightShift, 229), (.rightAlt, 230), (.rightGUI, 231),
+        ]
+        var observed = Set<Int>(), pressed = Set<Int>()
+        for (key, hid) in keys {
+            guard let button = keyboard.button(forKeyCode: key) else { continue }
+            observed.insert(hid)
+            if button.isPressed { pressed.insert(hid) }
+        }
+        return RemoteInput.pointerModifiers(fallback: fallback, observedHIDs: observed, pressedHIDs: pressed)
+    }
 
     override func becomeFirstResponder() -> Bool {
         let focused = super.becomeFirstResponder()
@@ -95,7 +131,9 @@ final class RemoteKeyboardView: UIView, UITextViewDelegate {
     }
 
     override func pressesBegan(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        guard forwardingEnabled, !softwareKeyboard else { super.pressesBegan(presses, with: event); return }
+        guard forwardingEnabled, !softwareKeyboard, inputSceneIsActive else {
+            super.pressesBegan(presses, with: event); return
+        }
         var local = Set<UIPress>()
         for press in presses {
             guard let key = press.key, RemoteInput.macKeyCode(forHID: key.keyCode.rawValue) != nil else {
@@ -121,11 +159,14 @@ final class RemoteKeyboardView: UIView, UITextViewDelegate {
     }
 
     override func pressesCancelled(_ presses: Set<UIPress>, with event: UIPressesEvent?) {
-        let local = finish(presses)
-        if !local.isEmpty { super.pressesCancelled(local, with: event) }
+        // iPadOS owns Command-Tab and can cancel without delivering its final
+        // key-up. Cancellation ends the whole remote press epoch.
+        releaseKeys()
+        super.pressesCancelled(presses, with: event)
     }
 
     private func finish(_ presses: Set<UIPress>) -> Set<UIPress> {
+        guard forwardingEnabled, inputSceneIsActive else { releaseKeys(); return presses }
         var local = Set<UIPress>()
         for press in presses {
             if press.key?.keyCode == .keyboardCapsLock, !softwareKeyboard {
@@ -156,8 +197,7 @@ final class RemoteKeyboardView: UIView, UITextViewDelegate {
     }
 
     private func capsLockChanged(down: Bool) {
-        guard forwardingEnabled, window != nil, isFirstResponder, !softwareKeyboard,
-              UIApplication.shared.applicationState == .active,
+        guard forwardingEnabled, inputSceneIsActive, isFirstResponder, !softwareKeyboard,
               receiver?.supportsRemoteInput == true else {
             inputSourceSwitchKey.reset()
             return
