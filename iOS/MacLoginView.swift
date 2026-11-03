@@ -93,14 +93,50 @@ struct MacLoginEndpoint: Equatable {
 }
 
 /// Queue-confined, back-pressured byte transport. No listener or new Mac daemon.
+enum MacLoginTransportEnd {
+    case network(NWError)
+    case timedOut
+    case serverClosed
+    case queueLimit
+    case cancelled
+
+    func message(host: String, connected: Bool) -> String {
+        switch self {
+        case .network(let error):
+            return connected
+                ? "已连接 Mac，但登录连接中断：\(error.localizedDescription)"
+                : "无法连接 \(host):5900：\(error.localizedDescription)。请核对 Mac 当前地址和屏幕共享。"
+        case .timedOut:
+            return "连接 \(host):5900 超时。Mac 的 IP 可能已变化；请核对当前地址，或使用 Mac 的 .local 主机名。"
+        case .serverClosed:
+            return "Mac 已关闭屏幕共享连接。如已完成登录，请返回 OpenDisplay；否则请重新连接。"
+        case .queueLimit:
+            return "登录连接发送积压过多，已停止；请重新连接。"
+        case .cancelled:
+            return "登录连接已关闭。"
+        }
+    }
+
+    var diagnosticCode: String {
+        switch self {
+        case .network: return "network-error"
+        case .timedOut: return "tcp-timeout"
+        case .serverClosed: return "server-closed"
+        case .queueLimit: return "send-queue-limit"
+        case .cancelled: return "cancelled"
+        }
+    }
+}
+
 final class MacLoginTransport {
     private let queue = DispatchQueue(label: "opendisplay.mac-login")
     private let connection: NWConnection
     private var closed = false
+    private var established = false
     private var pendingBytes = 0
     var onReady: (() -> Void)?
     var onBytes: ((Data, @escaping () -> Void) -> Void)?
-    var onClose: (() -> Void)?
+    var onClose: ((MacLoginTransportEnd) -> Void)?
 
     init(endpoint: MacLoginEndpoint) {
         let tcp = NWProtocolTCP.Options()
@@ -116,15 +152,21 @@ final class MacLoginTransport {
         connection.stateUpdateHandler = { [weak self] state in
             guard let self, !self.closed else { return }
             switch state {
-            case .ready: self.onReady?()
-            case .failed, .waiting: self.finish()
+            case .ready:
+                guard !self.established else { return }
+                self.established = true
+                self.onReady?()
+            case .failed(let error): self.finish(.network(error))
+            // A waiting path may recover (for example while Wi-Fi wakes).
+            // The bounded connection deadline below remains in force.
+            case .waiting: break
             default: break
             }
         }
         connection.start(queue: queue)
         queue.asyncAfter(deadline: .now() + 15) { [weak self] in
-            guard let self, self.connection.state != .ready else { return }
-            self.finish()
+            guard let self, !self.established else { return }
+            self.finish(.timedOut)
         }
     }
 
@@ -141,11 +183,13 @@ final class MacLoginTransport {
                 onBytes(data) { [weak self] in
                     guard let self else { return }
                     self.queue.async {
-                        if complete || error != nil { self.finish() }
+                        if let error { self.finish(.network(error)) }
+                        else if complete { self.finish(.serverClosed) }
                         else { self.readNext() }
                     }
                 }
-            } else if complete || error != nil { self.finish() }
+            } else if let error { self.finish(.network(error)) }
+            else if complete { self.finish(.serverClosed) }
             else { self.readNext() }
         }
     }
@@ -154,24 +198,24 @@ final class MacLoginTransport {
         queue.async { [weak self] in
             guard let self, !self.closed else { return }
             guard data.count <= 256 * 1024,
-                  self.pendingBytes + data.count <= 1024 * 1024 else { self.finish(); return }
+                  self.pendingBytes + data.count <= 1024 * 1024 else { self.finish(.queueLimit); return }
             self.pendingBytes += data.count
             self.connection.send(content: data, completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
                 self.pendingBytes -= data.count
-                if error != nil { self.finish() }
+                if let error { self.finish(.network(error)) }
             })
         }
     }
 
-    func cancel() { queue.async { [weak self] in self?.finish() } }
+    func cancel() { queue.async { [weak self] in self?.finish(.cancelled) } }
 
-    private func finish() {
+    private func finish(_ reason: MacLoginTransportEnd) {
         guard !closed else { return }
         closed = true
         connection.stateUpdateHandler = nil
         connection.cancel()
-        onClose?()
+        onClose?(reason)
     }
 }
 
@@ -181,6 +225,7 @@ final class MacLoginSession: NSObject, ObservableObject {
     private var endpoint: MacLoginEndpoint?
     private var credentials: [String: String]?
     private var transport: MacLoginTransport?
+    private var tcpConnected = false
     fileprivate private(set) var generation = UUID()
     weak var webView: WKWebView?
 
@@ -191,6 +236,7 @@ final class MacLoginSession: NSObject, ObservableObject {
         }
         cancel()
         self.endpoint = endpoint
+        tcpConnected = false
         credentials = ["username": username, "password": password]
         status = "正在连接 Mac 登录画面…"
         started = true
@@ -244,6 +290,9 @@ final class MacLoginSession: NSObject, ObservableObject {
                       let data = try? JSONSerialization.data(withJSONObject: credentials),
                       let json = String(data: data, encoding: .utf8), let webView = self.webView else { return }
                 self.credentials = nil
+                self.tcpConnected = true
+                self.status = "已连接 Mac，正在协商屏幕共享认证…"
+                Log.info("Mac login: TCP connected")
                 webView.evaluateJavaScript("window.openDisplayLogin.start(\(json))") { [weak self, weak socket] _, error in
                     guard let self, self.generation == token else { return }
                     if error != nil { self.fail("无法启动登录画面，请重新连接。") }
@@ -261,10 +310,11 @@ final class MacLoginSession: NSObject, ObservableObject {
                 }
             }
         }
-        socket.onClose = { [weak self] in
+        socket.onClose = { [weak self] reason in
             DispatchQueue.main.async {
                 guard let self, self.generation == token else { return }
-                self.fail("无法连接 Mac 屏幕共享。请确认已通过 SSH 解锁磁盘、屏幕共享已开启，且地址可达。")
+                Log.info("Mac login transport ended: \(reason.diagnosticCode), tcpConnected=\(self.tcpConnected)")
+                self.fail(reason.message(host: endpoint.host, connected: self.tcpConnected))
             }
         }
         socket.start()
