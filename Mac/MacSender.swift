@@ -191,6 +191,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var lastHello: PhoneInfo?
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
     private var inputInjector: InputInjector?
+    private let remoteUserActivity = RemoteUserActivity()
 
     // Liveness: both sides ping every 2s; if nothing arrives for 5s the link
     // is half-open (e.g. usbmuxd accepted but the device is gone) — reconnect.
@@ -1428,7 +1429,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     func stop() {
         stopped = true
         let injector = inputInjector
-        queue.async { injector?.releaseRemoteInput() }
+        let activity = remoteUserActivity
+        queue.async {
+            injector?.releaseRemoteInput()
+            activity.reset()
+        }
         invalidateCapturePipeline(discardingLastFrame: true)
         stopCursorPositionEcho()
         cursorImageTimer?.cancel()
@@ -2169,6 +2174,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func scheduleReconnect() {
         guard !stopped else { return }
         inputInjector?.releaseRemoteInput()
+        remoteUserActivity.reset()
         if everConnected {
             if let since = disconnectedSince {
                 if Date().timeIntervalSince(since) > disconnectGraceSeconds {
@@ -2602,6 +2608,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private func handleControl(_ payload: Data) {
+        guard !stopped else { return }
         lastReceived = Date()
         guard let obj = try? JSONSerialization.jsonObject(with: payload) as? [String: Any],
               let type = obj["type"] as? String else {
@@ -2613,6 +2620,8 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             )
             return
         }
+        // Runs even while capture is unavailable: input is what must wake it.
+        remoteUserActivity.record(obj)
         switch type {
         case "controlBarrier":
             guard let offer = controlOffer, obj["token"] as? String == offer.token,
@@ -2776,6 +2785,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         case "inputReset":
             remoteCapsLock.releaseKey()
             inputInjector?.releaseRemoteInput()
+            remoteUserActivity.reset()
         case "touch":
             if let phase = obj["phase"] as? String,
                let x = obj["x"] as? Double,
