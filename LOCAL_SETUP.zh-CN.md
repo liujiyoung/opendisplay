@@ -45,9 +45,11 @@ Mac → USB-C 数据线 → **iPad 机身 USB-C 口**。妙控键盘通过 Smart
 
 OpenDisplay 的接收设备连接及有线链路探测显式使用局域网直连，避免系统 SOCKS/HTTP 代理接管设备流量或把代理回环误判为有线链路。此设置仅作用于应用的设备连接，不修改系统代理或 GitHub 的 Git 代理配置。
 
-2026-11-04 在随身 Wi-Fi 下复现 USB → Wi-Fi 停在 `Connected`：控制 TCP 已建立且收到 HEVC 配置，但视频 TCP 积压约 129 KiB，采样约 1.18 MB 发送计数中约 778 KB 为重传，接收端没有构建新的视频格式。相同局域网对照中，IPv4 1400 字节 ICMP 负载 4/4 通过、平均 5.86 ms；IPv6 1400 字节负载（总长 1448）4/4 丢失，而 1100 字节负载 4/4 通过、1232 字节负载（总长 1280）3/3 通过。该表现符合 IPv6 路径 MTU 黑洞，不能把已建立控制连接等同于视频可用。
+2026-11-04 在随身 Wi-Fi 下复现 USB → Wi-Fi 停在 `Connected`：控制 TCP 已建立且收到 HEVC 配置，但视频 TCP 积压约 129 KiB，采样约 1.18 MB 发送计数中约 778 KB 为重传，接收端没有构建新的视频格式。相同局域网对照中，IPv4 1400 字节 ICMP 负载 4/4 通过、平均 5.86 ms；IPv6 1400 字节负载（总长 1448）4/4 丢失，而 1100 字节负载 4/4 通过、1232 字节负载（总长 1280）3/3 通过。该差异曾提示 MTU 问题，但后续普通 TCP 套接字在 IPv6 下仍能完整发送约 1 MB，因此不能仅凭 ICMP 结果认定根因；已建立控制连接也不等于视频可用。
 
-发送端对移动设备及尚未识别的 TCP 对端设置 `NWProtocolIP.Options.useMinimumMTU = true`，将 IPv6 数据包控制在 1280 字节的最低 MTU 范围；已识别的 Mac 对端保持原路径策略。该设置仅作用于应用连接，不改变系统 MTU、路由器或 Git 代理，保留 IPv4/IPv6 可用性，可能增加 IPv6 数据包数量。另为 TCP/USB 回调增加当前连接归属检查，并在迁移前解绑旧回调，避免旧连接延迟取消影响新连接的视频发送门。见 [Apple 最小 MTU 接口说明](https://developer.apple.com/documentation/network/nwprotocolip/options/useminimummtu)。189 项 Mac 回归测试通过；此网络修复的真机插拔验收仍待确认。
+第一版 `useMinimumMTU` 经用户复测仍停在 `Connected`，不标记成功。同路径的 Network.framework 受控约 1 MB 传输中，默认 IPv6 耗时约 2.04 秒，最小 IP MTU 模式 6 秒超时，显式 `maximumSegmentSize = 1200` 模式约 0.78 秒完成，IPv4 默认模式约 0.95 秒完成；这些是一次传输耗时，不是键鼠延迟或长期吞吐结论。
+
+发送端据此改为对移动设备及尚未识别的 TCP 对端设置 `NWProtocolTCP.Options.maximumSegmentSize = 1200`，限制 TCP 段而不使用上述最小 IP MTU 模式；已识别的 Mac 对端保持原路径策略。该设置仅作用于应用的视频 TCP 连接，不改变系统 MTU、路由器或 Git 代理，保留 IPv4/IPv6 可用性，可能增加数据包数量。USB/usbmux 保持原有传输。另为 TCP/USB 回调增加当前连接归属检查，并在迁移前解绑旧回调，避免旧连接延迟取消影响新连接的视频发送门。见 [Apple TCP 选项说明](https://developer.apple.com/documentation/network/nwprotocoltcp/options)。189 项 Mac 回归测试通过；最终设置的真机插拔验收仍待确认。
 
 无线连接支持按会话绑定的独立可靠控制通道：默认视频 TCP 9000、光标 UDP 9001、键鼠与心跳 TCP 9002（自定义基准端口时分别为基准、+1、+2）。控制通道使用独立网络队列、关闭 Nagle，并绕过局域网代理；UDP 不可用时，光标也可经独立 TCP 返回。切换前等待旧通道输入顺序屏障，按键和鼠标按钮不跨连接乱序。独立通道在启用前失败时保留原通道；启用后失效则释放远端按键并重连，不重放可能已执行的点击。失败后冷却 30 秒再允许新尝试，避免反复中断无头桌面。旧版本和 USB 使用原有可靠通道。可在 Mac 启动参数追加 `-disableIndependentControl YES` 做同版本对照；此开关默认关闭，日常连接自动协商。
 

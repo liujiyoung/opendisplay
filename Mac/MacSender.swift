@@ -2030,6 +2030,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func connectTCP(_ endpoint: NWEndpoint) {
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
+        if lastHello?.device != "Mac" {
+            // Mobile hotspot IPv6 paths can retransmit full-sized video
+            // segments indefinitely while tiny control messages still work.
+            // Cap TCP's segments, not IP fragments: useMinimumMTU alone
+            // failed the same 1 MB Network.framework transfer on this path.
+            options.maximumSegmentSize = 1200
+        }
         // No interface steering: macOS already ranks a Thunderbolt Bridge or
         // Ethernet link above WiFi, so a plain dial lands on the cable when
         // there is one (field-tested: en10 chosen over en0). A WiFi-prohibited
@@ -2040,14 +2047,6 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // proxy can otherwise accept on lo0 and close before the peer's hello,
         // or make a WiFi connection look like a direct cable to path detection.
         params.preferNoProxies = true
-        if lastHello?.device != "Mac",
-           let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
-            // Some mobile routers accept small IPv6 control packets but
-            // blackhole full-sized video segments without useful PMTU errors.
-            // Keep mobile/unknown peers within IPv6's 1280-byte minimum;
-            // IPv4 and known Mac-to-Mac cable paths retain their normal MTU.
-            ip.useMinimumMTU = true
-        }
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
         // A dial to a withdrawn Bonjour service (receiver asleep or app
