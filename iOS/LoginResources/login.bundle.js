@@ -20327,18 +20327,18 @@ RFB.prototype.ardCurtainUnlock = function() {
     { detail: { active: false } }
   ));
 };
-RFB.prototype._ardSendSessionVisibility = function(visible, message) {
+RFB.prototype._ardSendSessionVisibility = function(visible2, message) {
   const enc = new TextEncoder();
-  const msgBytes = visible ? new Uint8Array(0) : enc.encode(message);
+  const msgBytes = visible2 ? new Uint8Array(0) : enc.encode(message);
   const msgLen = msgBytes.length;
   this._sock.sQpush8(12);
   this._sock.sQpush8(0);
-  this._sock.sQpush16(visible ? 1 : 0);
+  this._sock.sQpush16(visible2 ? 1 : 0);
   this._sock.sQpush16(msgLen);
   for (let i = 0; i < msgLen; i++) {
     this._sock.sQpush8(msgBytes[i]);
   }
-  Info("ARD: SessionVisibility \u2192 " + (visible ? "show" : "curtain") + " msgLen=" + msgLen);
+  Info("ARD: SessionVisibility \u2192 " + (visible2 ? "show" : "curtain") + " msgLen=" + msgLen);
 };
 RFB.prototype._handleRect = function() {
   if (this._rfbAppleARD) {
@@ -21284,26 +21284,65 @@ var channel;
 var encryptionTimer;
 var encrypted = false;
 var connected = false;
+var visible = true;
 var post = (message) => window.webkit.messageHandlers.macLogin.postMessage(message);
+var autoFBUpdate = RFB.messages.ardAutoFBUpdate;
+RFB.messages.ardAutoFBUpdate = (sock, enabled, ...region) => {
+  if (sock.openDisplayLoginPaused && enabled) return;
+  autoFBUpdate(sock, enabled, ...region);
+};
+var fbUpdateRequest = RFB.messages.fbUpdateRequest;
+RFB.messages.fbUpdateRequest = (sock, ...args) => {
+  if (!sock.openDisplayLoginPaused) fbUpdateRequest(sock, ...args);
+};
 function stop() {
   clearTimeout(encryptionTimer);
-  rfb?.disconnect();
+  const old = rfb;
   rfb = null;
   channel = null;
   encrypted = connected = false;
+  old?.disconnect();
   document.getElementById("screen").replaceChildren();
+}
+function setVisible(value) {
+  visible = !!value;
+  if (!rfb) return;
+  if (!visible) rfb._keyboard.ungrab();
+  rfb.viewOnly = !visible || !encrypted || !connected;
+  if (visible && !rfb.viewOnly) rfb.focus();
+  else rfb.blur();
+  if (!encrypted || !connected) return;
+  const sock = rfb._sock;
+  sock.openDisplayLoginPaused = !visible;
+  RFB.messages.ardAutoFBUpdate(
+    sock,
+    visible ? 1 : 0,
+    0,
+    0,
+    rfb._fbWidth,
+    rfb._fbHeight
+  );
+  if (visible) RFB.messages.fbUpdateRequest(
+    sock,
+    false,
+    0,
+    0,
+    rfb._fbWidth,
+    rfb._fbHeight
+  );
 }
 function enableControl() {
   if (!encrypted || !connected || !rfb) return;
   clearTimeout(encryptionTimer);
-  rfb.viewOnly = false;
   rfb._rfbCredentials = {};
-  rfb.focus();
+  setVisible(visible);
+  post({ type: "authenticated" });
   post({ type: "status", value: "\u5DF2\u8FDE\u63A5\u5E76\u52A0\u5BC6\uFF0C\u8BF7\u5728\u753B\u9762\u4E2D\u767B\u5F55 Mac" });
 }
 window.openDisplayLogin = {
   start(credentials) {
     stop();
+    visible = true;
     channel = {
       readyState: "connecting",
       binaryType: "arraybuffer",
@@ -21317,6 +21356,7 @@ window.openDisplayLogin = {
       onclose() {
       },
       send(bytes) {
+        if (channel !== this || this.readyState !== "open") return;
         const data = bytes instanceof ArrayBuffer ? new Uint8Array(bytes) : bytes;
         let binary = "";
         for (let i = 0; i < data.length; i += 8192) {
@@ -21327,32 +21367,39 @@ window.openDisplayLogin = {
       close() {
         if (this.readyState === "closed") return;
         this.readyState = "closed";
-        post({ type: "close" });
+        if (channel === this) post({ type: "close" });
       }
     };
     rfb = new RFB(document.getElementById("screen"), channel, { credentials, shared: true });
+    const client = rfb;
     rfb._ardVirtualLogin = 0;
     rfb._ardQualityPreset = "millions";
     rfb.scaleViewport = true;
     rfb.resizeSession = false;
     rfb.viewOnly = true;
     rfb.addEventListener("connect", () => {
+      if (rfb !== client) return;
       connected = true;
       enableControl();
     });
     rfb.addEventListener("ardencryptionstate", (event) => {
+      if (rfb !== client) return;
       encrypted = event.detail.state === "full";
       enableControl();
     });
     rfb.addEventListener("credentialsrequired", () => {
+      if (rfb !== client) return;
       post({ type: "failure", value: "Mac \u9700\u8981\u91CD\u65B0\u8BA4\u8BC1\uFF0C\u8BF7\u8FD4\u56DE\u540E\u91CD\u65B0\u8F93\u5165\u7528\u6237\u540D\u548C\u5BC6\u7801\u3002" });
       stop();
     });
     rfb.addEventListener("securityfailure", () => {
+      if (rfb !== client) return;
       post({ type: "failure", value: "Mac \u62D2\u7EDD\u4E86\u8BA4\u8BC1\uFF0C\u8BF7\u6838\u5BF9 Mac \u7528\u6237\u540D\u3001\u767B\u5F55\u5BC6\u7801\u548C\u5C4F\u5E55\u5171\u4EAB\u6743\u9650\u3002" });
       stop();
     });
-    rfb.addEventListener("disconnect", () => post({ type: "close" }));
+    rfb.addEventListener("disconnect", () => {
+      if (rfb === client) post({ type: "close" });
+    });
     encryptionTimer = setTimeout(() => {
       if (!encrypted) {
         post({ type: "failure", value: "Mac \u672A\u80FD\u5EFA\u7ACB\u52A0\u5BC6\u767B\u5F55\u8FDE\u63A5\uFF0C\u5DF2\u505C\u6B62\uFF1B\u8BF7\u6838\u5BF9\u5C4F\u5E55\u5171\u4EAB\u548C\u7F51\u7EDC\u3002" });
@@ -21369,11 +21416,12 @@ window.openDisplayLogin = {
     channel.onmessage({ data: data.buffer });
   },
   key(keysym) {
-    if (!encrypted || !connected || !rfb) return;
+    if (!visible || !encrypted || !connected || !rfb) return;
     rfb.sendKey(keysym, null, true);
     rfb.sendKey(keysym, null, false);
     rfb.focus();
   },
+  setVisible,
   stop
 };
 post({ type: "ready" });

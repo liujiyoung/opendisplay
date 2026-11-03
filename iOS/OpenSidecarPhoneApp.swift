@@ -69,6 +69,7 @@ extension UIWindow {
 struct ReceiverScreen: View {
     @ObservedObject var pointerCapture: RelativePointerCapture
     @StateObject private var model = ReceiverModel()
+    @StateObject private var macLoginSession = MacLoginSession()
     @StateObject private var versionGate = VersionGate()
     @State private var showSettings = false
     @State private var showOnboarding = false
@@ -83,9 +84,10 @@ struct ReceiverScreen: View {
     @AppStorage("hasConnectedBefore") private var hasConnectedBefore = false
     @AppStorage("onboardingDismissed") private var onboardingDismissed = false
 
-    // Streaming = connected and the video format is known.
+    // A reconnect handshake can succeed repeatedly without delivering video.
     private var isStreaming: Bool {
         model.receiver.connected && model.receiver.videoSize != .zero
+            && model.receiver.videoPresentation.isReady
     }
 
     private var shouldCapturePointer: Bool {
@@ -189,6 +191,16 @@ struct ReceiverScreen: View {
                         }
                         .allowsHitTesting(false)   // never block touch input
                     }
+                } else if model.receiver.connected && model.receiver.videoPresentation.isLocked {
+                    Color(.systemBackground).ignoresSafeArea()
+                    VStack(spacing: 20) {
+                        Image(systemName: "lock.display").font(.system(size: 52))
+                        Text("Mac 已锁定").font(.title2.bold())
+                        Text("使用 Mac 登录查看并解锁屏幕。解锁后会自动恢复桌面。")
+                            .foregroundColor(.secondary).multilineTextAlignment(.center)
+                        Button("Mac 登录") { showMacLogin = true }
+                            .buttonStyle(.borderedProminent)
+                    }.padding(32)
                 } else {
                     IdleView(receiver: model.receiver, showSettings: $showSettings,
                              showMacLogin: $showMacLogin)
@@ -208,10 +220,10 @@ struct ReceiverScreen: View {
             SettingsView(receiver: model.receiver)
         }
         .fullScreenCover(isPresented: $showMacLogin) {
-            MacLoginView()
+            MacLoginView(session: macLoginSession)
         }
-        .onChange(of: isStreaming) { streaming in
-            if streaming { showMacLogin = false }
+        .onChange(of: isStreaming && macLoginSession.authenticated) { ready in
+            if ready { showMacLogin = false }
         }
         // Below the force floor → blocking gate. Setter is a no-op: the user
         // cannot dismiss it, only update.
@@ -241,6 +253,7 @@ struct ReceiverScreen: View {
             pointerCapture.enabled = shouldCapturePointer
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
+            macLoginSession.cancel()
             model.receiver.resetRemoteInput()
             pointerCapture.enabled = false
         }
@@ -254,6 +267,7 @@ struct ReceiverScreen: View {
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.protectedDataWillBecomeUnavailableNotification)) { _ in
             Log.info("protected data will become unavailable (device locking)")
+            macLoginSession.cancel()
             model.deviceWillLock()
         }
         .onReceive(NotificationCenter.default.publisher(
@@ -267,6 +281,7 @@ struct ReceiverScreen: View {
         // dead apps stop accepting redials, so the silence grace fires.
         .onReceive(NotificationCenter.default.publisher(
             for: UIApplication.willTerminateNotification)) { _ in
+            macLoginSession.cancel()
             model.appWillTerminate()
         }
         .onChange(of: model.receiver.connected) { isConnected in

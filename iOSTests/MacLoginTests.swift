@@ -54,6 +54,45 @@ final class MacLoginTests: XCTestCase {
         XCTAssertTrue(keyboard.canBecomeFirstResponder)
     }
 
+    func testStreamingHandoffKeepsAuthenticatedLoginAndReusesItsWebView() {
+        let session = MacLoginSession()
+        session.begin(host: "192.0.2.1", username: "test", password: "test-only")
+        let view = session.makeWebView()
+        let generation = session.generation
+        session.handle(["type": "authenticated"])
+
+        // This used to cancel and destroy the RFB viewer on every dismissal,
+        // letting macOS re-lock immediately after a successful unlock.
+        session.leaveLogin()
+        XCTAssertTrue(session.started)
+        XCTAssertTrue(session.authenticated)
+        XCTAssertFalse(session.visible)
+        XCTAssertEqual(session.generation, generation)
+        XCTAssertTrue(session.webView === view)
+
+        session.resumeLogin()
+        XCTAssertTrue(session.visible)
+        XCTAssertTrue(session.makeWebView() === view)
+        session.cancel() // Same cleanup used when the app leaves the foreground.
+        XCTAssertFalse(session.started)
+        XCTAssertFalse(session.authenticated)
+        XCTAssertNil(session.webView)
+        XCTAssertNotEqual(session.generation, generation)
+        session.handle(["type": "authenticated"])
+        XCTAssertFalse(session.authenticated)
+    }
+
+    func testLeavingAnUnfinishedLoginCancelsInsteadOfKeepingCredentials() {
+        let session = MacLoginSession()
+        session.begin(host: "192.0.2.1", username: "test", password: "test-only")
+        let generation = session.generation
+        session.leaveLogin()
+        XCTAssertFalse(session.started)
+        XCTAssertFalse(session.authenticated)
+        XCTAssertNotEqual(session.generation, generation)
+        XCTAssertNil(session.webView)
+    }
+
     private final class BootstrapHandler: NSObject, WKScriptMessageHandler {
         let ready: XCTestExpectation
         var failure: String?

@@ -6,7 +6,7 @@ import Network
 /// Aqua LaunchAgent can run. FileVault must first be unlocked over SSH.
 struct MacLoginView: View {
     @Environment(\.dismiss) private var dismiss
-    @StateObject private var session = MacLoginSession()
+    @ObservedObject var session: MacLoginSession
     @AppStorage("macLoginHost") private var host = ""
     @AppStorage("macLoginUsername") private var username = ""
     @State private var password = ""
@@ -18,7 +18,7 @@ struct MacLoginView: View {
                     VStack(spacing: 0) {
                         Text(session.status).font(.footnote).padding(8)
                             .frame(maxWidth: .infinity).background(Color(.secondarySystemBackground))
-                        MacLoginWebView(session: session)
+                        MacLoginWebView(session: session).id(session.generation)
                         HStack(spacing: 24) {
                             Button("Tab") { session.sendKey(0xff09) }
                             Button("Return") { session.sendKey(0xff0d) }
@@ -30,7 +30,7 @@ struct MacLoginView: View {
                 } else {
                     Form {
                         Section {
-                            Text("冷启动后先通过 SSH 密码认证解锁 FileVault，再在这里完成 Mac 桌面登录。登录后会自动返回 OpenDisplay 画面。")
+                            Text("Mac 锁屏时可在这里连接并解锁。冷启动且 FileVault 开启时，先通过 SSH 密码认证解锁磁盘，再完成桌面登录。恢复画面后会自动返回 OpenDisplay。")
                         }
                         Section(header: Text("Mac 账户")) {
                             TextField("Mac 局域网 IP 或 .local 名称", text: $host)
@@ -61,15 +61,15 @@ struct MacLoginView: View {
             .navigationBarTitleDisplayMode(.inline)
             .toolbar {
                 ToolbarItem(placement: .navigationBarTrailing) {
-                    Button("返回 OpenDisplay") { session.cancel(); dismiss() }
+                    Button("返回 OpenDisplay") { dismiss() }
                 }
             }
         }
         .navigationViewStyle(.stack)
-        .onDisappear { password = ""; session.cancel() }
+        .onAppear { session.resumeLogin() }
+        .onDisappear { password = ""; session.leaveLogin() }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             password = ""
-            session.cancel()
         }
     }
 }
@@ -222,12 +222,17 @@ final class MacLoginTransport {
 final class MacLoginSession: NSObject, ObservableObject {
     @Published private(set) var started = false
     @Published private(set) var status = ""
+    @Published private(set) var authenticated = false
+    private(set) var visible = true
     private var endpoint: MacLoginEndpoint?
     private var credentials: [String: String]?
     private var transport: MacLoginTransport?
     private var tcpConnected = false
-    fileprivate private(set) var generation = UUID()
-    weak var webView: WKWebView?
+    private(set) var generation = UUID()
+    // Owned by the receiver screen, not the presented login view. Disconnecting
+    // the last Screen Sharing viewer can re-lock the console it just unlocked.
+    // Keep its encrypted session alive during foreground OpenDisplay use.
+    private(set) var webView: WKWebView?
 
     func begin(host: String, username: String, password: String) {
         guard let endpoint = MacLoginEndpoint(host), !username.isEmpty, !password.isEmpty else {
@@ -235,6 +240,7 @@ final class MacLoginSession: NSObject, ObservableObject {
             return
         }
         cancel()
+        visible = true
         self.endpoint = endpoint
         tcpConnected = false
         credentials = ["username": username, "password": password]
@@ -245,14 +251,35 @@ final class MacLoginSession: NSObject, ObservableObject {
     func cancel() {
         generation = UUID()
         credentials = nil
+        authenticated = false
         let old = transport
         transport = nil
         old?.cancel()
-        webView?.evaluateJavaScript("window.openDisplayLogin?.stop()", completionHandler: nil)
         started = false
+        let oldView = webView
+        webView = nil
+        oldView?.configuration.userContentController.removeScriptMessageHandler(forName: "macLogin")
+        oldView?.navigationDelegate = nil
+        oldView?.stopLoading()
+        oldView?.loadHTMLString("", baseURL: nil)
+    }
+
+    func resumeLogin() {
+        visible = true
+        webView?.evaluateJavaScript("window.openDisplayLogin?.setVisible(true)", completionHandler: nil)
+    }
+
+    func leaveLogin() {
+        visible = false
+        guard authenticated else { cancel(); return }
+        // Hide input and stop framebuffer updates without closing the socket.
+        // Reopening Mac Login reuses this same WebKit/RFB session, no password.
+        webView?.evaluateJavaScript("window.openDisplayLogin?.setVisible(false)", completionHandler: nil)
+        Log.info("Mac login: handed off to streaming; retaining authenticated connection")
     }
 
     func sendKey(_ keysym: UInt32) {
+        guard visible, authenticated else { return }
         webView?.evaluateJavaScript("window.openDisplayLogin?.key(\(keysym))", completionHandler: nil)
     }
 
@@ -266,6 +293,9 @@ final class MacLoginSession: NSObject, ObservableObject {
             transport?.send(data)
         case "status":
             if let value = message["value"] as? String { status = String(value.prefix(300)) }
+        case "authenticated":
+            authenticated = true
+            Log.info("Mac login: encrypted session authenticated")
         case "failure":
             fail((message["value"] as? String) ?? "登录连接失败。")
         case "close":
@@ -319,41 +349,28 @@ final class MacLoginSession: NSObject, ObservableObject {
         }
         socket.start()
     }
-}
 
-private struct MacLoginWebView: UIViewRepresentable {
-    let session: MacLoginSession
-
-    func makeCoordinator() -> Coordinator { Coordinator(session: session) }
-
-    func makeUIView(context: Context) -> WKWebView {
+    func makeWebView() -> WKWebView {
+        if let webView { return webView }
+        let coordinator = Coordinator(session: self)
         let configuration = WKWebViewConfiguration()
         configuration.websiteDataStore = .nonPersistent()
-        configuration.userContentController.add(context.coordinator, name: "macLogin")
+        configuration.userContentController.add(coordinator, name: "macLogin")
         let view = WKWebView(frame: .zero, configuration: configuration)
-        view.navigationDelegate = context.coordinator
+        view.navigationDelegate = coordinator
         view.scrollView.isScrollEnabled = false
         view.isOpaque = false
         view.backgroundColor = .black
-        session.webView = view
+        webView = view
         if let url = Bundle.main.url(forResource: "index", withExtension: "html", subdirectory: "LoginResources") {
             view.loadFileURL(url, allowingReadAccessTo: url.deletingLastPathComponent())
         } else {
-            session.handle(["type": "failure", "value": "登录画面资源缺失，请重新安装接收端。"])
+            handle(["type": "failure", "value": "登录画面资源缺失，请重新安装接收端。"])
         }
         return view
     }
 
-    func updateUIView(_ uiView: WKWebView, context: Context) {}
-
-    static func dismantleUIView(_ uiView: WKWebView, coordinator: Coordinator) {
-        uiView.configuration.userContentController.removeScriptMessageHandler(forName: "macLogin")
-        uiView.navigationDelegate = nil
-        uiView.stopLoading()
-        uiView.loadHTMLString("", baseURL: nil)
-    }
-
-    final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
+    private final class Coordinator: NSObject, WKScriptMessageHandler, WKNavigationDelegate {
         weak var session: MacLoginSession?
         private let generation: UUID
         init(session: MacLoginSession) { self.session = session; generation = session.generation }
@@ -367,10 +384,20 @@ private struct MacLoginWebView: UIViewRepresentable {
             decisionHandler(url?.isFileURL == true || url?.absoluteString == "about:blank" ? .allow : .cancel)
         }
         func webView(_ webView: WKWebView, didFail navigation: WKNavigation!, withError error: Error) {
+            guard session?.generation == generation else { return }
             session?.handle(["type": "failure", "value": "无法载入登录画面。"])
         }
         func webView(_ webView: WKWebView, didFailProvisionalNavigation navigation: WKNavigation!, withError error: Error) {
+            guard session?.generation == generation else { return }
             session?.handle(["type": "failure", "value": "无法载入登录画面。"])
         }
     }
+}
+
+private struct MacLoginWebView: UIViewRepresentable {
+    let session: MacLoginSession
+
+    func makeUIView(context: Context) -> WKWebView { session.makeWebView() }
+    func updateUIView(_ uiView: WKWebView, context: Context) {}
+    // Removing the view during handoff must not stop its authenticated session.
 }
