@@ -70,6 +70,11 @@ final class StreamReceiver: ObservableObject {
     @Published var fps = 0
     @Published var connected = false
     @Published var videoSize = CGSize.zero   // for touch coordinate mapping
+    @Published private(set) var videoPresentation = ReceiverVideoPresentation()
+    // Queue-confined; UI publications carry the generation they belong to.
+    private var videoGeneration: UInt64 = 0
+    private var announcedVideoFrame = false
+    private var remoteScreenLocked = false
     @Published var perf = PerfStats()
     // Compatibility signal from the connected Mac (issue #132). Nil = no signal.
     // Merged into the update gate by ReceiverScreen.
@@ -417,6 +422,14 @@ final class StreamReceiver: ObservableObject {
     func ensureListening() {
         queue.async {
             guard !self.listenerHealthy else { return }
+            if let listener = self.listener {
+                switch listener.state {
+                case .setup, .waiting: return // already starting/recovering
+                case .ready: self.listenerHealthy = true; return
+                case .failed, .cancelled: break
+                @unknown default: return
+                }
+            }
             Log.info("listener not healthy — restarting")
             self.restartListener()
         }
@@ -607,6 +620,8 @@ final class StreamReceiver: ObservableObject {
     }
 
     private func startListener() {
+        guard listener == nil else { return }
+        let listener: NWListener
         do {
             // noDelay matters most in THIS direction: touch events are tiny
             // packets, and Nagle would hold each one until the previous is
@@ -617,21 +632,19 @@ final class StreamReceiver: ObservableObject {
             params.allowLocalEndpointReuse = true
             params.serviceClass = .interactiveVideo
             listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
+            self.listener = listener
         } catch {
             setStatus("Listener failed: \(error.localizedDescription)")
             return
         }
         // Advertise on the local network so the Mac can discover us for WiFi
         // mode (USB/usbmux connects straight to the port and ignores this).
-        listener?.service = advertisedService
-        listener?.newConnectionHandler = { [weak self] conn in
-            guard let self else { return }
+        listener.service = advertisedService
+        listener.newConnectionHandler = { [weak self, weak listener] conn in
+            guard let self, let listener, self.listener === listener else { conn.cancel(); return }
             Log.info("new connection from \(String(describing: conn.endpoint))")
             // usbmux-forwarded (cable) connections arrive from loopback;
             // anything else came over the network.
-            let peer = String(describing: conn.endpoint)
-            self.transport = (peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1")
-                              || peer.hasPrefix("localhost")) ? "USB" : "WiFi"
             // A Bonjour dial races IPv6 and IPv4 and both handshakes can
             // complete; the sender cancels its loser within milliseconds.
             // Adopting every newcomer at once evicted the winner for a
@@ -679,23 +692,26 @@ final class StreamReceiver: ObservableObject {
                 self.adopt(conn)
             }
         }
-        listener?.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+        listener.stateUpdateHandler = { [weak self, weak listener] state in
+            guard let self, let listener, self.listener === listener else { return }
             switch state {
             case .ready:
                 self.listenerHealthy = true
-                self.setStatus("Ready to connect")
+                if self.connection == nil { self.setStatus("Ready to connect") }
             case .failed(let error):
                 Log.info("listener failed: \(error) — restarting in 1s")
                 self.listenerHealthy = false
                 self.setStatus("Listener failed — restarting…")
-                self.queue.asyncAfter(deadline: .now() + 1) { self.restartListener() }
+                self.queue.asyncAfter(deadline: .now() + 1) { [weak self, weak listener] in
+                    guard let self, let listener, self.listener === listener else { return }
+                    self.restartListener()
+                }
             case .cancelled:
                 self.listenerHealthy = false
             default: break
             }
         }
-        listener?.start(queue: queue)
+        listener.start(queue: queue)
         startCursorListener()
         startControlListener()
     }
@@ -841,6 +857,9 @@ final class StreamReceiver: ObservableObject {
         let onReady: () -> Void = { [weak self] in
             guard let self else { return }
             self.lastDataReceived = Date()
+            let peer = String(describing: conn.endpoint)
+            self.transport = (peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1")
+                              || peer.hasPrefix("localhost")) ? "USB" : "WiFi"
             // Non-loopback is WiFi only if the path says so: a Mac receiver on
             // a Thunderbolt Bridge or USB-C peer link is a cable too.
             if self.transport != "USB", let path = conn.currentPath {
@@ -993,6 +1012,7 @@ final class StreamReceiver: ObservableObject {
             }
             lastRttMs = rtt
         case "ping":
+            updateScreenLocked(obj["screenLocked"] as? Bool)
             // The Mac piggybacks its send-side health on liveness pings.
             if let enc = obj["encDrops"] as? Int {
                 macEncDrops = enc
@@ -1022,6 +1042,7 @@ final class StreamReceiver: ObservableObject {
                 self.onCursorImage?(image, anchor, normSize)
             }
         case WireMessage.welcome:
+            updateScreenLocked(obj["screenLocked"] as? Bool)
             // The Mac identified itself (issue #132). If it speaks a protocol
             // older than we support, it's the Mac that needs updating — and an
             // old Mac can't diagnose that itself, so we surface it here.
@@ -1111,6 +1132,14 @@ final class StreamReceiver: ObservableObject {
     }
 
     private func resetStreamState() {
+        videoGeneration &+= 1
+        announcedVideoFrame = false
+        remoteScreenLocked = false
+        let generation = videoGeneration
+        DispatchQueue.main.async {
+            self.videoPresentation.begin(generation)
+            self.videoSize = .zero
+        }
         resetLatencySamples()
         supportsLatencyProbes = false
         latencySession = UUID().uuidString
@@ -1134,6 +1163,25 @@ final class StreamReceiver: ObservableObject {
         }
         decodeWindow.removeAll(keepingCapacity: true)
         photonWindow.removeAll(keepingCapacity: true)
+    }
+
+    private func updateScreenLocked(_ value: Bool?) {
+        guard let value, value != remoteScreenLocked else { return }
+        remoteScreenLocked = value
+        announcedVideoFrame = false
+        let generation = videoGeneration
+        DispatchQueue.main.async {
+            self.videoPresentation.setLocked(value, generation: generation)
+        }
+    }
+
+    private func announceVideoFrame() {
+        guard !announcedVideoFrame, !remoteScreenLocked else { return }
+        announcedVideoFrame = true
+        let generation = videoGeneration
+        DispatchQueue.main.async {
+            self.videoPresentation.receivedFrame(generation)
+        }
     }
 
     // MARK: - Control messages (phone -> Mac)
@@ -1675,6 +1723,7 @@ final class StreamReceiver: ObservableObject {
             }
             displayLayer.enqueue(sample)
         }
+        announceVideoFrame()
 
         // Per-frame timing for the performance overlay.
         let now = Date()
@@ -1870,9 +1919,13 @@ final class StreamReceiver: ObservableObject {
     }
 
     private func setConnected(_ value: Bool) {
+        let generation = videoGeneration
         DispatchQueue.main.async {
+            guard self.videoPresentation.generation == generation else { return }
             self.connected = value
             if !value {
+                self.videoPresentation.end(generation)
+                self.videoSize = .zero
                 self.macProtocolVersion = WireProtocol.assumedWhenAbsent
                 self.supportsRemoteInput = false
                 self.supportsRelativePointer = false

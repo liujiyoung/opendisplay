@@ -216,6 +216,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // otherwise any sleep longer than the budget ends the session. Set while
     // deferring so the wait logs once. On `queue`.
     private var waitingForConsole = false
+    private var reportedScreenLocked: Bool?
     // The one pending recovery tick, cancelled and replaced on every arm so
     // a stream dying while a round is in flight can't leave two chains
     // running (both would fire on unlock and race `startCapture`, orphaning
@@ -1490,6 +1491,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.connectionReady = false
             self.currentPathDirectLink = false   // the new transport re-classifies
             self.dialGeneration += 1   // a dial still in flight must not adopt
+            // A delayed cancellation must not close the new connection's
+            // video gate after its ready callback (as in migrate(to:)).
+            self.connection?.stateUpdateHandler = nil
+            self.connection?.viabilityUpdateHandler = nil
             self.connection?.cancel()
             self.connection = nil
             self.closeCursorChannel()
@@ -1681,6 +1686,18 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         let onConsole = info[kCGSessionOnConsoleKey as String] as? Bool ?? true
         let locked = info["CGSSessionScreenIsLocked"] as? Bool ?? false
         return onConsole && !locked
+    }
+
+    /// The normal desktop capture may freeze at the lock boundary. Let the
+    /// receiver offer its authenticated Screen Sharing login instead.
+    private func screenLockedForPeer() -> Bool {
+        let info = CGSessionCopyCurrentDictionary() as? [String: Any]
+        let locked = info?["CGSSessionScreenIsLocked"] as? Bool ?? false
+        if reportedScreenLocked != locked {
+            reportedScreenLocked = locked
+            Log.info("Mac screen lock state: \(locked)")
+        }
+        return locked
     }
 
     /// Whether a recovery attempt can succeed right now. SCK finds no
@@ -2023,6 +2040,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // proxy can otherwise accept on lo0 and close before the peer's hello,
         // or make a WiFi connection look like a direct cable to path detection.
         params.preferNoProxies = true
+        if lastHello?.device != "Mac",
+           let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            // Some mobile routers accept small IPv6 control packets but
+            // blackhole full-sized video segments without useful PMTU errors.
+            // Keep mobile/unknown peers within IPv6's 1280-byte minimum;
+            // IPv4 and known Mac-to-Mac cable paths retain their normal MTU.
+            ip.useMinimumMTU = true
+        }
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
         // A dial to a withdrawn Bonjour service (receiver asleep or app
@@ -2039,7 +2064,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self.scheduleReconnect()
         }
         conn.stateUpdateHandler = { [weak self] state in
-            guard let self else { return }
+            guard let self, !self.stopped, self.connection === conn else { return }
             switch state {
             case .ready:
                 self.becomeReady(conn)
@@ -2102,7 +2127,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     }
                     self.connection = conn
                     conn.stateUpdateHandler = { [weak self] state in
-                        guard let self else { return }
+                        guard let self, !self.stopped, self.connection === conn else { return }
                         switch state {
                         case .failed(let error):
                             Log.info("usb connection failed: \(error)")
@@ -2228,7 +2253,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 let sorted = self.inputLatencies.sorted()
                 let inp50 = sorted.isEmpty ? 0 : sorted[sorted.count / 2].rounded()
                 let inp95 = sorted.isEmpty ? 0 : sorted[min(sorted.count - 1, Int(Double(sorted.count) * 0.95))].rounded()
-                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps)}")
+                self.sendJSONFrame("{\"type\":\"ping\",\"drops\":\(self.dropsTotal),\"encDrops\":\(self.dropsEncTotal),\"netDrops\":\(self.dropsNetTotal),\"pending\":\(self.pendingSends),\"inp50\":\(inp50),\"inp95\":\(inp95),\"capFps\":\(capFps),\"screenLocked\":\(self.screenLockedForPeer())}")
             }
             self.schedulePing()
         }
@@ -3525,7 +3550,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Identify ourselves to the receiver: our protocol version and the oldest
     /// receiver version we still support.
     private func sendWelcome() {
-        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"remoteInput\":\(RemoteInput.relativePointerCapability),\"capsLockKey\":\(RemoteInput.capsLockKeyCapability),\"latencyProbes\":1}")
+        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"remoteInput\":\(RemoteInput.relativePointerCapability),\"capsLockKey\":\(RemoteInput.capsLockKeyCapability),\"latencyProbes\":1,\"screenLocked\":\(screenLockedForPeer())}")
     }
 
     /// Announce the operating point before video. Legacy receivers ignore the
