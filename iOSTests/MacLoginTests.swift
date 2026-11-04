@@ -70,6 +70,15 @@ final class MacLoginTests: XCTestCase {
         XCTAssertEqual(session.generation, generation)
         XCTAssertTrue(session.webView === view)
 
+        // Video can be paused independently of the retained encrypted session.
+        XCTAssertTrue(session.inputOnly)
+        session.setInputOnly(false)
+        XCTAssertFalse(session.inputOnly)
+        session.setInputOnly(true)
+        XCTAssertTrue(session.authenticated)
+        XCTAssertEqual(session.generation, generation)
+        XCTAssertTrue(session.webView === view)
+
         session.resumeLogin()
         XCTAssertTrue(session.visible)
         XCTAssertTrue(session.makeWebView() === view)

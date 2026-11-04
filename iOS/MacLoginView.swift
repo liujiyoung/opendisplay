@@ -18,6 +18,7 @@ struct MacLoginView: View {
                     VStack(spacing: 0) {
                         Text(session.status).font(.footnote).padding(8)
                             .frame(maxWidth: .infinity).background(Color(.secondarySystemBackground))
+                        inputOnlyToggle.padding(.horizontal, 16).padding(.vertical, 6)
                         MacLoginWebView(session: session).id(session.generation)
                         HStack(spacing: 24) {
                             Button("Tab") { session.sendKey(0xff09) }
@@ -31,6 +32,7 @@ struct MacLoginView: View {
                     Form {
                         Section {
                             Text("Mac 锁屏时可在这里连接并解锁。冷启动且 FileVault 开启时，先通过 SSH 密码认证解锁磁盘，再完成桌面登录。恢复画面后会自动返回 OpenDisplay。")
+                            inputOnlyToggle
                         }
                         Section(header: Text("Mac 账户")) {
                             TextField("Mac 局域网 IP 或 .local 名称", text: $host)
@@ -71,6 +73,12 @@ struct MacLoginView: View {
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
             password = ""
         }
+    }
+
+    private var inputOnlyToggle: some View {
+        Toggle("辅助盲输（暂停登录画面）", isOn: Binding(
+            get: { session.inputOnly }, set: { session.setInputOnly($0) }))
+            .accessibilityIdentifier("macLoginInputOnly")
     }
 }
 
@@ -223,6 +231,7 @@ final class MacLoginSession: NSObject, ObservableObject {
     @Published private(set) var started = false
     @Published private(set) var status = ""
     @Published private(set) var authenticated = false
+    @Published private(set) var inputOnly = true
     private(set) var visible = true
     private var endpoint: MacLoginEndpoint?
     private var credentials: [String: String]?
@@ -283,6 +292,11 @@ final class MacLoginSession: NSObject, ObservableObject {
         webView?.evaluateJavaScript("window.openDisplayLogin?.key(\(keysym))", completionHandler: nil)
     }
 
+    func setInputOnly(_ value: Bool) {
+        inputOnly = value
+        webView?.evaluateJavaScript("window.openDisplayLogin?.setInputOnly(\(value))", completionHandler: nil)
+    }
+
     func handle(_ body: Any) {
         guard started, let message = body as? [String: Any], let type = message["type"] as? String else { return }
         switch type {
@@ -323,7 +337,7 @@ final class MacLoginSession: NSObject, ObservableObject {
                 self.tcpConnected = true
                 self.status = "已连接 Mac，正在协商屏幕共享认证…"
                 Log.info("Mac login: TCP connected")
-                webView.evaluateJavaScript("window.openDisplayLogin.start(\(json))") { [weak self, weak socket] _, error in
+                webView.evaluateJavaScript("window.openDisplayLogin.start(\(json), {inputOnly: \(self.inputOnly)})") { [weak self, weak socket] _, error in
                     guard let self, self.generation == token else { return }
                     if error != nil { self.fail("无法启动登录画面，请重新连接。") }
                     else { socket?.receive() }

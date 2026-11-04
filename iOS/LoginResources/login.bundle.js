@@ -5,9 +5,9 @@ var __getOwnPropNames = Object.getOwnPropertyNames;
 var __esm = (fn, res) => function __init() {
   return fn && (res = (0, fn[__getOwnPropNames(fn)[0]])(fn = 0)), res;
 };
-var __export = (target, all) => {
+var __export = (target2, all) => {
   for (var name in all)
-    __defProp(target, name, { get: all[name], enumerable: true });
+    __defProp(target2, name, { get: all[name], enumerable: true });
 };
 
 // ThirdParty/LoginVNC/ard/hp/seq.js
@@ -529,9 +529,9 @@ window.addEventListener("touchstart", function onFirstTouch() {
 var dragThreshold = 10 * (window.devicePixelRatio || 1);
 var _supportsCursorURIs = false;
 try {
-  const target = document.createElement("canvas");
-  target.style.cursor = 'url("data:image/x-icon;base64,AAACAAEACAgAAAIAAgA4AQAAFgAAACgAAAAIAAAAEAAAAAEAIAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAD/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////AAAAAAAAAAAAAAAAAAAAAA==") 2 2, default';
-  if (target.style.cursor.indexOf("url") === 0) {
+  const target2 = document.createElement("canvas");
+  target2.style.cursor = 'url("data:image/x-icon;base64,AAACAAEACAgAAAIAAgA4AQAAFgAAACgAAAAIAAAAEAAAAAEAIAAAAAAAEAAAAAAAAAAAAAAAAAAAAAAAAAD/////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////////AAAAAAAAAAAAAAAAAAAAAA==") 2 2, default';
+  if (target2.style.cursor.indexOf("url") === 0) {
     Info("Data URI scheme cursor supported");
     _supportsCursorURIs = true;
   } else {
@@ -667,10 +667,10 @@ function _capturedElemChanged() {
   proxyElem.style.cursor = window.getComputedStyle(document.captureElement).cursor;
 }
 var _captureObserver = new MutationObserver(_capturedElemChanged);
-function setCapture(target) {
-  if (target.setCapture) {
-    target.setCapture();
-    document.captureElement = target;
+function setCapture(target2) {
+  if (target2.setCapture) {
+    target2.setCapture();
+    document.captureElement = target2;
   } else {
     releaseCapture();
     let proxyElem = document.getElementById("noVNC_mouse_capture_elem");
@@ -689,8 +689,8 @@ function setCapture(target) {
       proxyElem.addEventListener("mousemove", _captureProxy);
       proxyElem.addEventListener("mouseup", _captureProxy);
     }
-    document.captureElement = target;
-    _captureObserver.observe(target, { attributes: true });
+    document.captureElement = target2;
+    _captureObserver.observe(target2, { attributes: true });
     _capturedElemChanged();
     proxyElem.style.display = "";
     window.addEventListener("mousemove", _captureProxy);
@@ -742,7 +742,7 @@ var EventTargetMixin = class {
 
 // ThirdParty/LoginVNC/noVNC/core/display.js
 var Display = class {
-  constructor(target) {
+  constructor(target2) {
     this._drawCtx = null;
     this._renderQ = [];
     this._flushPromise = null;
@@ -750,7 +750,7 @@ var Display = class {
     this._fbHeight = 0;
     this._prevDrawStyle = "";
     Debug(">> Display.constructor");
-    this._target = target;
+    this._target = target2;
     if (!this._target) {
       throw new Error("Target must be set");
     }
@@ -1196,8 +1196,8 @@ var Display = class {
 
 // ThirdParty/LoginVNC/noVNC/core/clipboard.js
 var AsyncClipboard = class {
-  constructor(target) {
-    this._target = target || null;
+  constructor(target2) {
+    this._target = target2 || null;
     this._isAvailable = null;
     this._eventHandlers = {
       "focus": this._handleFocus.bind(this)
@@ -7429,8 +7429,8 @@ function getKeysym(evt) {
 
 // ThirdParty/LoginVNC/noVNC/core/input/keyboard.js
 var Keyboard = class {
-  constructor(target) {
-    this._target = target || null;
+  constructor(target2) {
+    this._target = target2 || null;
     this._keyDownList = {};
     this._altGrArmed = false;
     this._eventHandlers = {
@@ -7636,9 +7636,9 @@ var GestureHandler = class {
     this._twoTouchTimeoutId = null;
     this._boundEventHandler = this._eventHandler.bind(this);
   }
-  attach(target) {
+  attach(target2) {
     this.detach();
-    this._target = target;
+    this._target = target2;
     this._target.addEventListener(
       "touchstart",
       this._boundEventHandler
@@ -8056,11 +8056,11 @@ var Cursor = class {
       "mouseup": this._handleMouseUp.bind(this)
     };
   }
-  attach(target) {
+  attach(target2) {
     if (this._target) {
       this.detach();
     }
-    this._target = target;
+    this._target = target2;
     if (useFallback) {
       document.body.appendChild(this._canvas);
       const options = { capture: true, passive: true };
@@ -8132,8 +8132,8 @@ var Cursor = class {
       this._position.y = clientY;
     }
     this._updatePosition();
-    let target = document.elementFromPoint(clientX, clientY);
-    this._updateVisibility(target);
+    let target2 = document.elementFromPoint(clientX, clientY);
+    this._updateVisibility(target2);
   }
   _handleMouseOver(event) {
     this._handleMouseMove(event);
@@ -8148,18 +8148,18 @@ var Cursor = class {
     this._updatePosition();
   }
   _handleMouseUp(event) {
-    let target = document.elementFromPoint(event.clientX, event.clientY);
-    this._updateVisibility(target);
+    let target2 = document.elementFromPoint(event.clientX, event.clientY);
+    this._updateVisibility(target2);
     if (this._captureIsActive()) {
       window.setTimeout(() => {
         if (!this._target) {
           return;
         }
-        target = document.elementFromPoint(
+        target2 = document.elementFromPoint(
           event.clientX,
           event.clientY
         );
-        this._updateVisibility(target);
+        this._updateVisibility(target2);
       }, 0);
     }
   }
@@ -8176,26 +8176,26 @@ var Cursor = class {
   // Should we currently display the cursor?
   // (i.e. are we over the target, or a child of the target without a
   // different cursor set)
-  _shouldShowCursor(target) {
-    if (!target) {
+  _shouldShowCursor(target2) {
+    if (!target2) {
       return false;
     }
-    if (target === this._target) {
+    if (target2 === this._target) {
       return true;
     }
-    if (!this._target.contains(target)) {
+    if (!this._target.contains(target2)) {
       return false;
     }
-    if (window.getComputedStyle(target).cursor !== "none") {
+    if (window.getComputedStyle(target2).cursor !== "none") {
       return false;
     }
     return true;
   }
-  _updateVisibility(target) {
+  _updateVisibility(target2) {
     if (this._captureIsActive()) {
-      target = document.captureElement;
+      target2 = document.captureElement;
     }
-    if (this._shouldShowCursor(target)) {
+    if (this._shouldShowCursor(target2)) {
       this._showCursor();
     } else {
       this._hideCursor();
@@ -8316,8 +8316,8 @@ var Websock = class {
       return this._rQ.subarray(this._rQi - len, this._rQi);
     }
   }
-  rQshiftTo(target, len) {
-    target.set(new Uint8Array(this._rQ.buffer, this._rQi, len));
+  rQshiftTo(target2, len) {
+    target2.set(new Uint8Array(this._rQ.buffer, this._rQi, len));
     this._rQi += len;
   }
   rQpeekBytes(len, copy = true) {
@@ -11708,8 +11708,8 @@ var extendedClipboardActionPeek = 1 << 26;
 var extendedClipboardActionNotify = 1 << 27;
 var extendedClipboardActionProvide = 1 << 28;
 var RFB = class _RFB extends EventTargetMixin {
-  constructor(target, urlOrChannel, options) {
-    if (!target) {
+  constructor(target2, urlOrChannel, options) {
+    if (!target2) {
       throw new Error("Must specify target");
     }
     if (!urlOrChannel) {
@@ -11719,7 +11719,7 @@ var RFB = class _RFB extends EventTargetMixin {
       Error2("noVNC requires a secure context (TLS). Expect crashes!");
     }
     super();
-    this._target = target;
+    this._target = target2;
     if (typeof urlOrChannel === "string") {
       this._url = urlOrChannel;
     } else {
@@ -18977,8 +18977,8 @@ var VideoSink = class {
    * stripes:  how many stripes make one picture
    * onError(reason):  the decoder failed; the sink is unusable afterwards
    */
-  constructor({ target, view, width, height, stripes, onFirstFrame, onFirstPicture, onError }) {
-    this._target = target;
+  constructor({ target: target2, view, width, height, stripes, onFirstFrame, onFirstPicture, onError }) {
+    this._target = target2;
     this._view = view || (() => null);
     this._viewKey = "";
     this._onFirstFrame = onFirstFrame || (() => {
@@ -19005,11 +19005,11 @@ var VideoSink = class {
       visibility: "hidden"
     });
     this._ctx = this._canvas.getContext("2d", { alpha: false, desynchronized: true });
-    target.insertAdjacentElement("afterend", this._canvas);
+    target2.insertAdjacentElement("afterend", this._canvas);
     this._align = this._align.bind(this);
     this._observer = new ResizeObserver(this._align);
-    this._observer.observe(target);
-    if (target.parentElement) this._observer.observe(target.parentElement);
+    this._observer.observe(target2);
+    if (target2.parentElement) this._observer.observe(target2.parentElement);
     window.addEventListener("resize", this._align);
     this._align();
     this._watch = () => {
@@ -21285,7 +21285,50 @@ var encryptionTimer;
 var encrypted = false;
 var connected = false;
 var visible = true;
+var inputOnly = true;
 var post = (message) => window.webkit.messageHandlers.macLogin.postMessage(message);
+var screen = document.getElementById("screen");
+var guide = document.getElementById("guide");
+var target = document.getElementById("guide-target");
+var guideFrame = document.getElementById("guide-frame");
+var guideNote = document.getElementById("guide-note");
+function hasScreenSize() {
+  return rfb && rfb._fbWidth > 0 && rfb._fbHeight > 0;
+}
+function updateGuide() {
+  const shown = inputOnly && visible && encrypted && connected && !!rfb;
+  guide.hidden = !shown;
+  screen.classList.toggle("input-only", shown);
+  target.disabled = !shown || !hasScreenSize();
+  if (!shown) return;
+  const area = screen.getBoundingClientRect();
+  const canvas = hasScreenSize() ? rfb._canvas.getBoundingClientRect() : area;
+  const left = canvas.left - area.left, top = canvas.top - area.top;
+  Object.assign(guideFrame.style, {
+    left: `${left}px`,
+    top: `${top}px`,
+    width: `${canvas.width}px`,
+    height: `${canvas.height}px`
+  });
+  target.style.left = `${left + canvas.width * 0.5}px`;
+  target.style.top = `${top + canvas.height * 0.9}px`;
+  guideNote.textContent = hasScreenSize() ? "\u53C2\u8003\u4F4D\u7F6E\uFF1A\u8FDC\u7A0B\u5C4F\u5E55\u4E2D\u592E\u300190% \u9AD8\u5EA6\u3002\u4E0D\u540C Mac \u767B\u5F55\u5E03\u5C40\u53EF\u80FD\u504F\u79FB\uFF1B\u8FD9\u91CC\u4E0D\u4F1A\u663E\u793A\u6216\u4FDD\u5B58\u5BC6\u7801\u3002" : "\u6B63\u5728\u7B49\u5F85 Mac \u5C4F\u5E55\u5C3A\u5BF8\uFF0C\u6682\u4E0D\u80FD\u53D1\u9001\u5B9A\u4F4D\u70B9\u51FB\u3002\u53EF\u5173\u95ED\u5F00\u5173\u6062\u590D\u753B\u9762\u3002";
+}
+var resizeFramebuffer = RFB.prototype._resize;
+RFB.prototype._resize = function(width, height) {
+  resizeFramebuffer.call(this, width, height);
+  if (this === rfb) updateGuide();
+};
+window.addEventListener("resize", updateGuide);
+function focusPasswordReference() {
+  if (!visible || !inputOnly || !encrypted || !connected || !hasScreenSize()) return;
+  const rect = rfb._canvas.getBoundingClientRect();
+  rfb._handleMouseButton(rect.width * 0.5, rect.height * 0.9, 1);
+  rfb._handleMouseButton(rect.width * 0.5, rect.height * 0.9, 0);
+  rfb.focus({ preventScroll: true });
+  post({ type: "status", value: "\u5DF2\u70B9\u51FB\u5BC6\u7801\u6846\u53C2\u8003\u4F4D\u7F6E\uFF1B\u8BF7\u76F4\u63A5\u8F93\u5165 Mac \u5BC6\u7801\u5E76\u6309 Return\uFF08\u753B\u9762\u5DF2\u6682\u505C\uFF09" });
+}
+target.addEventListener("click", focusPasswordReference);
 var autoFBUpdate = RFB.messages.ardAutoFBUpdate;
 RFB.messages.ardAutoFBUpdate = (sock, enabled, ...region) => {
   if (sock.openDisplayLoginPaused && enabled) return;
@@ -21302,10 +21345,12 @@ function stop() {
   channel = null;
   encrypted = connected = false;
   old?.disconnect();
-  document.getElementById("screen").replaceChildren();
+  screen.replaceChildren();
+  updateGuide();
 }
 function setVisible(value) {
   visible = !!value;
+  updateGuide();
   if (!rfb) return;
   if (!visible) rfb._keyboard.ungrab();
   rfb.viewOnly = !visible || !encrypted || !connected;
@@ -21313,16 +21358,17 @@ function setVisible(value) {
   else rfb.blur();
   if (!encrypted || !connected) return;
   const sock = rfb._sock;
-  sock.openDisplayLoginPaused = !visible;
+  const showVideo = visible && !inputOnly;
+  sock.openDisplayLoginPaused = !showVideo;
   RFB.messages.ardAutoFBUpdate(
     sock,
-    visible ? 1 : 0,
+    showVideo ? 1 : 0,
     0,
     0,
     rfb._fbWidth,
     rfb._fbHeight
   );
-  if (visible) RFB.messages.fbUpdateRequest(
+  if (showVideo) RFB.messages.fbUpdateRequest(
     sock,
     false,
     0,
@@ -21331,18 +21377,23 @@ function setVisible(value) {
     rfb._fbHeight
   );
 }
+function setInputOnly(value) {
+  inputOnly = !!value;
+  setVisible(visible);
+  if (encrypted && connected) post({ type: "status", value: inputOnly ? "\u5DF2\u8FDE\u63A5\u5E76\u52A0\u5BC6 \xB7 \u4EC5\u952E\u9F20\u63A7\u5236\uFF0C\u8BF7\u70B9\u51FB\u5BC6\u7801\u6846\u53C2\u8003\u4F4D\u7F6E" : "\u5DF2\u8FDE\u63A5\u5E76\u52A0\u5BC6\uFF0C\u8BF7\u5728\u753B\u9762\u4E2D\u767B\u5F55 Mac" });
+}
 function enableControl() {
   if (!encrypted || !connected || !rfb) return;
   clearTimeout(encryptionTimer);
   rfb._rfbCredentials = {};
-  setVisible(visible);
   post({ type: "authenticated" });
-  post({ type: "status", value: "\u5DF2\u8FDE\u63A5\u5E76\u52A0\u5BC6\uFF0C\u8BF7\u5728\u753B\u9762\u4E2D\u767B\u5F55 Mac" });
+  setInputOnly(inputOnly);
 }
 window.openDisplayLogin = {
-  start(credentials) {
+  start(credentials, options = {}) {
     stop();
     visible = true;
+    inputOnly = options.inputOnly !== false;
     channel = {
       readyState: "connecting",
       binaryType: "arraybuffer",
@@ -21370,7 +21421,7 @@ window.openDisplayLogin = {
         if (channel === this) post({ type: "close" });
       }
     };
-    rfb = new RFB(document.getElementById("screen"), channel, { credentials, shared: true });
+    rfb = new RFB(screen, channel, { credentials, shared: true });
     const client = rfb;
     rfb._ardVirtualLogin = 0;
     rfb._ardQualityPreset = "millions";
@@ -21422,6 +21473,8 @@ window.openDisplayLogin = {
     rfb.focus();
   },
   setVisible,
+  setInputOnly,
+  focusPasswordReference,
   stop
 };
 post({ type: "ready" });
