@@ -2027,7 +2027,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         return result
     }
 
-    private func connectTCP(_ endpoint: NWEndpoint) {
+    private func connectTCP(_ endpoint: NWEndpoint, allowingIPv6: Bool = false) {
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
         if lastHello?.device != "Mac" {
@@ -2047,8 +2047,26 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // proxy can otherwise accept on lo0 and close before the peer's hello,
         // or make a WiFi connection look like a direct cable to path detection.
         params.preferNoProxies = true
+        params.serviceClass = .interactiveVideo
+        let mobileBonjour: Bool
+        if case .service = endpoint { mobileBonjour = lastHello?.device != "Mac" }
+        else { mobileBonjour = false }
+        let tryingIPv4 = mobileBonjour && !allowingIPv6
+        if tryingIPv4, let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
+            ip.version = .v4
+        }
         let conn = NWConnection(to: endpoint, using: params)
         connection = conn
+        var established = false // this connection's queue-confined dial phase
+        let retryWithIPv6 = { [weak self] in
+            guard let self, !self.stopped, self.connection === conn else { return }
+            Log.info("mobile receiver IPv4 dial unavailable — retrying with IPv6 enabled")
+            conn.stateUpdateHandler = nil
+            conn.viabilityUpdateHandler = nil
+            self.connection = nil
+            conn.cancel()
+            self.connectTCP(endpoint, allowingIPv6: true)
+        }
         // A dial to a withdrawn Bonjour service (receiver asleep or app
         // closed) sits in .preparing forever — it neither fails nor resolves
         // when the service later returns, observed on macOS 26. Give every
@@ -2056,20 +2074,24 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // Bonjour resolution, so the retry loop reaches the receiver the
         // moment it advertises again.
         let generation = dialGeneration
-        queue.asyncAfter(deadline: .now() + 5.0) { [weak self] in
+        queue.asyncAfter(deadline: .now() + (tryingIPv4 ? 2.0 : 5.0)) { [weak self] in
             guard let self, generation == self.dialGeneration, !self.stopped,
-                  self.connection === conn, conn.state != .ready else { return }
+                  self.connection === conn, !established, conn.state != .ready else { return }
             Log.info("dial timed out in \(conn.state) — redialing")
-            self.scheduleReconnect()
+            if tryingIPv4 { retryWithIPv6() }
+            else { self.scheduleReconnect() }
         }
         conn.stateUpdateHandler = { [weak self] state in
             guard let self, !self.stopped, self.connection === conn else { return }
             switch state {
             case .ready:
+                established = true
+                if tryingIPv4 { Log.info("mobile receiver connected using IPv4") }
                 self.becomeReady(conn)
             case .failed(let error):
                 Log.info("connection failed: \(error)")
                 self.connectionReady = false
+                if tryingIPv4, !established { retryWithIPv6(); return }
                 if case .posix(let code) = error, code == .ECONNREFUSED {
                     self.dialRefused()
                 }
@@ -2083,6 +2105,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 // waiting as failure and poll by reconnecting.
                 Log.info("connection waiting: \(error) — will retry")
                 self.connectionReady = false
+                if tryingIPv4, !established { retryWithIPv6(); return }
                 // Read the queue-confined flag here (handler runs on queue),
                 // not inside the detached status Task.
                 let text = self.awaitingWake
@@ -2279,6 +2302,16 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                     Task { await self.status("\(self.endpointName) is silent — keeping the display (app in background or brief stall)") }
                     self.scheduleReconnect()
                 }
+            }
+            if self.connectionReady, !self.currentPathDirectLink,
+               case .tcp = self.transport,
+               VideoDeliveryWatchdog.shouldReconnect(
+                    now: ProcessInfo.processInfo.systemUptime,
+                    oldestPending: self.pendingVideoSendTimes.values.min(),
+                    peerSilence: Date().timeIntervalSince(self.lastReceived),
+                    consoleInteractive: self.consoleIsInteractive) {
+                Log.info("video send has made no progress for >5s despite live control — reconnecting")
+                self.scheduleReconnect()
             }
             // The disconnect grace is otherwise only evaluated when a dial
             // changes state — a dial stuck in .preparing (withdrawn Bonjour

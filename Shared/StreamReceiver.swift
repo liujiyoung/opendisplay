@@ -628,6 +628,7 @@ final class StreamReceiver: ObservableObject {
             // ACKed — batched, late drags read as input lag.
             let tcp = NWProtocolTCP.Options()
             tcp.noDelay = true
+            if deviceKind != "Mac" { tcp.maximumSegmentSize = 1200 }
             let params = NWParameters(tls: nil, tcp: tcp)
             params.allowLocalEndpointReuse = true
             params.serviceClass = .interactiveVideo
@@ -1576,6 +1577,12 @@ final class StreamReceiver: ObservableObject {
             }
         }
         guard !vclNALUs.isEmpty else { return }
+        guard formatDesc != nil else {
+            // A reconnect can join between parameter sets and the next IDR.
+            // Ask over the reliable control path instead of waiting forever.
+            requestKeyframeIfNeeded()
+            return
+        }
         // All slices of one wire frame go into ONE sample buffer.
         enqueueFrame(vclNALUs, captureMs: captureMs, sendMs: sendMs)
     }

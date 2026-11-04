@@ -163,6 +163,7 @@ targets:
       - Mac/OriginRestore.swift
       - Mac/StreamConfiguration.swift
       - Mac/AdaptiveVideoBitrate.swift
+      - Mac/VideoDeliveryWatchdog.swift
       - Mac/KeyboardPreferences.swift
       - Mac/RemoteUserActivity.swift
       - Mac/VirtualCanvasSizing.swift
