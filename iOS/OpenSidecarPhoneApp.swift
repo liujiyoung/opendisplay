@@ -1030,6 +1030,7 @@ struct VideoLayerView: UIViewRepresentable {
         }
 
         @objc func pointerHover(_ recognizer: UIHoverGestureRecognizer) {
+            pointerCapture?.observeUIKitHover(recognizer, in: self)
             guard pointerCapture?.isCapturing != true else { return }
             guard recognizer.state == .began || recognizer.state == .changed,
                   let p = normalized(recognizer.location(in: self)) else { return }

@@ -26,3 +26,41 @@ final class VideoLayoutTests: XCTestCase {
         XCTAssertFalse((RemoteKeyboardView() as Any) is UITextInput)
     }
 }
+
+final class RelativePointerInputHealthTests: XCTestCase {
+    func testIdleAndBackgroundDoNotTriggerInputRepairs() {
+        var health = RelativePointerInputHealth()
+        health.didBind(at: 0)
+        XCTAssertFalse(health.shouldRebind(now: 100, capturing: true))
+        health.uiMotion(at: 100)
+        XCTAssertFalse(health.shouldRebind(now: 100, capturing: false))
+        XCTAssertFalse(health.shouldRebind(now: 102, capturing: true))
+    }
+
+    func testRawAndUIKitMotionTogetherStayOnTheExistingBinding() {
+        var health = RelativePointerInputHealth()
+        health.didBind(at: 0)
+        for i in 1...100 {
+            let time = Double(i) / 10
+            health.rawMotion(at: time)
+            health.uiMotion(at: time + 0.01)
+            XCTAssertFalse(health.shouldRebind(now: time + 0.02, capturing: true))
+        }
+    }
+
+    func testContinuousUIKitMotionCanRepairSilentRawInputWithACooldown() {
+        var health = RelativePointerInputHealth()
+        health.didBind(at: 0)
+        health.rawMotion(at: 0.1)
+        health.uiMotion(at: 0.8)
+        XCTAssertFalse(health.shouldRebind(now: 0.9, capturing: true))
+        XCTAssertTrue(health.shouldRebind(now: 1, capturing: true))
+        health.didBind(at: 1)
+        health.uiMotion(at: 1.5)
+        XCTAssertFalse(health.shouldRebind(now: 1.5, capturing: true))
+        health.uiMotion(at: 2)
+        XCTAssertTrue(health.shouldRebind(now: 2, capturing: true))
+        health.rawMotion(at: 2)
+        XCTAssertFalse(health.shouldRebind(now: 2.1, capturing: true))
+    }
+}

@@ -38,12 +38,17 @@ final class RelativePointerCapture: ObservableObject {
     private var stateMonitor: Timer?
     private var rawMotionCount = 0
     private var forwardedMotionCount = 0
+    private var uiMotionCount = 0
+    private var rawButtonCount = 0
+    private var inputHealth = RelativePointerInputHealth()
+    private var lastHoverPoint: CGPoint?
     private var lastReport = ProcessInfo.processInfo.systemUptime
     private var reportIdleWindow = false
     var requestLockUpdate: (() -> Void)?
 
     init() {
-        for name in [Notification.Name.GCMouseDidConnect, .GCMouseDidDisconnect] {
+        for name in [Notification.Name.GCMouseDidConnect, .GCMouseDidDisconnect,
+                     .GCMouseDidBecomeCurrent] {
             observers.append(NotificationCenter.default.addObserver(forName: name, object: nil, queue: .main) {
                 [weak self] _ in
                 DispatchQueue.main.async { self?.refreshMice() }
@@ -88,28 +93,38 @@ final class RelativePointerCapture: ObservableObject {
 
     private func reconcileCapture() {
         let active = UIApplication.shared.applicationState == .active
+        let now = ProcessInfo.processInfo.systemUptime
         if enabled && active {
             let current = GCMouse.mice()
             let ids = Set(current.map(ObjectIdentifier.init))
             if ids != Set(mice.keys) || current.contains(where: {
                 $0.mouseInput !== mouseInputs[ObjectIdentifier($0)]
-            }) {
+            }) || current.contains(where: { $0.mouseInput?.mouseMovedHandler == nil }) {
                 refreshMice()
             }
             synchronizeLock()
+            // Rebind only when UIKit witnesses real movement while raw
+            // deltas stay silent. Ordinary idle time must not cycle capture.
+            if inputHealth.shouldRebind(now: now, capturing: isCapturing) {
+                Log.info("pointer input recovery: UIKit motion continued without raw deltas — rebinding")
+                refreshMice()
+            }
             // A transient system UI can release the lock without changing
             // our preference. Ask UIKit to reconsider once it is gone.
             if wantsLock && !locked { requestLockUpdate?() }
         }
-        let now = ProcessInfo.processInfo.systemUptime
         guard now - lastReport >= 5 else { return }
-        if rawMotionCount > 0 || reportIdleWindow {
+        if rawMotionCount > 0 || uiMotionCount > 0 || rawButtonCount > 0 || reportIdleWindow {
             Log.info("pointer input: raw=\(rawMotionCount) forwarded=\(forwardedMotionCount)"
-                     + " enabled=\(enabled) locked=\(locked) active=\(active) mice=\(mice.count)")
+                     + " ui=\(uiMotionCount) buttons=\(rawButtonCount)"
+                     + " enabled=\(enabled) locked=\(locked) active=\(active)"
+                     + " sceneActive=\(observedScene?.activationState == .foregroundActive) mice=\(mice.count)")
         }
-        reportIdleWindow = rawMotionCount > 0
+        reportIdleWindow = rawMotionCount > 0 || uiMotionCount > 0 || rawButtonCount > 0
         rawMotionCount = 0
         forwardedMotionCount = 0
+        uiMotionCount = 0
+        rawButtonCount = 0
         lastReport = now
     }
 
@@ -117,13 +132,31 @@ final class RelativePointerCapture: ObservableObject {
         guard locked != value else { return }
         locked = value
         Log.info("pointer lock: \(value ? "locked" : "released")")
-        if !value { releaseInput() }
+        if value {
+            // A new lock is a new delivery lease even if the device/profile
+            // objects survived. Keep the existing drag state when rebinding.
+            refreshMice()
+        } else { releaseInput() }
     }
 
     private func releaseInput() {
         receiver?.resetRemoteInput()
         clicks = RemoteClickTracker()
         loggedMotion = false
+        lastHoverPoint = nil
+        inputHealth = RelativePointerInputHealth()
+    }
+
+    func observeUIKitHover(_ recognizer: UIHoverGestureRecognizer, in view: UIView) {
+        guard recognizer.state == .began || recognizer.state == .changed else {
+            lastHoverPoint = nil
+            return
+        }
+        let point = recognizer.location(in: view)
+        defer { lastHoverPoint = point }
+        guard let previous = lastHoverPoint, previous != point else { return }
+        uiMotionCount += 1
+        inputHealth.uiMotion(at: ProcessInfo.processInfo.systemUptime)
     }
 
     private func refreshMice() {
@@ -152,8 +185,11 @@ final class RelativePointerCapture: ObservableObject {
             mice[id] = mouse
             mouseInputs[id] = input
             mouse.handlerQueue = .main
-            input.mouseMovedHandler = { [weak self] _, dx, dy in
-                DispatchQueue.main.async { self?.move(dx: Double(dx), dy: -Double(dy)) }
+            input.mouseMovedHandler = { [weak self] profile, dx, dy in
+                DispatchQueue.main.async {
+                    guard let self, self.mouseInputs[id] === profile else { return }
+                    self.move(dx: Double(dx), dy: -Double(dy))
+                }
             }
             input.leftButton.pressedChangedHandler = { [weak self] _, _, pressed in
                 DispatchQueue.main.async { self?.button(0, down: pressed) }
@@ -166,11 +202,13 @@ final class RelativePointerCapture: ObservableObject {
             }
         }
         if hasMouse != !mice.isEmpty { hasMouse = !mice.isEmpty }
+        inputHealth.didBind(at: ProcessInfo.processInfo.systemUptime)
         Log.info("raw pointing devices: \(mice.count)")
     }
 
     private func move(dx: Double, dy: Double) {
         rawMotionCount += 1
+        inputHealth.rawMotion(at: ProcessInfo.processInfo.systemUptime)
         guard isCapturing, dx.isFinite, dy.isFinite else { return }
         forwardedMotionCount += 1
         if !loggedMotion { Log.info("relative pointer input active"); loggedMotion = true }
@@ -181,12 +219,31 @@ final class RelativePointerCapture: ObservableObject {
     }
 
     private func button(_ button: Int, down: Bool) {
+        rawButtonCount += 1
         guard isCapturing else { return }
         let time = ProcessInfo.processInfo.systemUptime
         let count = down ? clicks.down(button: button, time: time, point: travel)
             : clicks.up(button: button, time: time, point: travel)
         receiver?.sendRelativePointer(phase: down ? "down" : "up", button: button, clicks: count,
             modifiers: RemoteKeyboardView.pointerModifiers(fallback: receiver?.remoteModifiers ?? 0))
+    }
+}
+
+/// Use independent UIKit motion to distinguish a silent raw-input binding
+/// from an idle trackpad. A repair never unlocks the pointer or releases a drag.
+struct RelativePointerInputHealth {
+    private var lastRaw = -Double.infinity
+    private var lastUI = -Double.infinity
+    private var lastBind = -Double.infinity
+
+    mutating func rawMotion(at time: Double) { lastRaw = time }
+    mutating func uiMotion(at time: Double) { lastUI = time }
+    mutating func didBind(at time: Double) { lastBind = time }
+
+    func shouldRebind(now: Double, capturing: Bool) -> Bool {
+        capturing && now.isFinite && lastUI.isFinite
+            && now >= lastUI && now - lastUI < 1
+            && now - lastBind >= 1 && lastUI - max(lastRaw, lastBind) >= 0.25
     }
 }
 
