@@ -1,9 +1,83 @@
 import XCTest
 import WebKit
+import Network
 @testable import OpenSidecariOS
 
 @MainActor
 final class MacLoginTests: XCTestCase {
+    func testUSBModeDoesNotRequireOrUseANetworkHost() {
+        let session = MacLoginSession()
+        session.begin(host: "https://invalid.example/no-lan", username: "test",
+                      password: "test-only", mode: .usb)
+        XCTAssertTrue(session.started)
+        XCTAssertEqual(session.mode, .usb)
+        session.cancel()
+        XCTAssertTrue(MacLoginTransport.isLoopback(.hostPort(host: "127.0.0.1", port: 9003)))
+        XCTAssertFalse(MacLoginTransport.isLoopback(.hostPort(host: "192.168.0.1", port: 9003)))
+    }
+
+    func testUSBTransportWaitsForRelayGreetingThenExchangesUnmodifiedRFBBytes() {
+        let ready = expectation(description: "USB relay greeting accepted")
+        let inbound = expectation(description: "RFB server greeting delivered")
+        let outbound = expectation(description: "RFB client bytes delivered")
+        let closed = expectation(description: "USB transport closed")
+        let queue = DispatchQueue(label: "usb-login-test-peer")
+        let transport = MacLoginTransport(endpoint: nil, mode: .usb)
+        let peer = NWConnection(host: "127.0.0.1", port: 9003, using: .tcp)
+        transport.onReady = {
+            ready.fulfill()
+            transport.receive()
+            transport.send(Data("client-rfb-bytes".utf8))
+        }
+        transport.onBytes = { data, consumed in
+            XCTAssertEqual(data, Data("RFB 003.889\n".utf8))
+            inbound.fulfill()
+            consumed()
+        }
+        transport.onClose = { _ in closed.fulfill() }
+        transport.start()
+        peer.stateUpdateHandler = { state in
+            if case .ready = state {
+                // A short USB read must not leak the relay header into noVNC.
+                peer.send(content: Data("ODLO".utf8), completion: .contentProcessed { _ in
+                    queue.asyncAfter(deadline: .now() + 0.1) {
+                        peer.send(content: Data("GIN1\nRFB 003.889\n".utf8), completion: .idempotent)
+                    }
+                })
+                peer.receive(minimumIncompleteLength: 16, maximumLength: 16) { data, _, _, _ in
+                    XCTAssertEqual(data, Data("client-rfb-bytes".utf8))
+                    outbound.fulfill()
+                }
+            }
+        }
+        queue.asyncAfter(deadline: .now() + 0.3) { peer.start(queue: queue) }
+        wait(for: [ready, inbound, outbound], timeout: 8)
+        transport.cancel()
+        wait(for: [closed], timeout: 2)
+        peer.cancel()
+    }
+
+    func testUSBTransportRejectsAnUnrecognizedRelayBeforeAuthentication() {
+        let rejected = expectation(description: "bad USB relay rejected")
+        let queue = DispatchQueue(label: "usb-login-bad-peer")
+        let transport = MacLoginTransport(endpoint: nil, mode: .usb)
+        let peer = NWConnection(host: "127.0.0.1", port: 9003, using: .tcp)
+        transport.onReady = { XCTFail("must not start RFB without the USB relay greeting") }
+        transport.onClose = { reason in
+            if case .invalidUSBRelay = reason {} else { XCTFail("unexpected close reason") }
+            rejected.fulfill()
+        }
+        transport.start()
+        peer.stateUpdateHandler = { state in
+            if case .ready = state {
+                peer.send(content: Data("BADLOGIN\n".utf8), completion: .idempotent)
+            }
+        }
+        queue.asyncAfter(deadline: .now() + 0.3) { peer.start(queue: queue) }
+        wait(for: [rejected], timeout: 8)
+        peer.cancel()
+    }
+
     func testEndpointAcceptsHostsButRejectsURLsCredentialsAndPorts() {
         XCTAssertEqual(MacLoginEndpoint(" 192.168.1.10 ")?.host, "192.168.1.10")
         XCTAssertEqual(MacLoginEndpoint("mac-mini.local")?.host, "mac-mini.local")

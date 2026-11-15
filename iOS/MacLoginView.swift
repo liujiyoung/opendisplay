@@ -3,13 +3,17 @@ import WebKit
 import Network
 
 /// A user-initiated bridge to macOS Screen Sharing, available before the sender's
-/// Aqua LaunchAgent can run. FileVault must first be unlocked over SSH.
+/// Aqua LaunchAgent can run. USB login requires the system relay and an unlocked
+/// data volume (FileVault off, or already unlocked).
 struct MacLoginView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var session: MacLoginSession
     @AppStorage("macLoginHost") private var host = ""
     @AppStorage("macLoginUsername") private var username = ""
     @State private var password = ""
+    @AppStorage("macLoginConnectionMode") private var connectionMode = MacLoginConnectionMode.usb.rawValue
+
+    private var mode: MacLoginConnectionMode { MacLoginConnectionMode(rawValue: connectionMode) ?? .usb }
 
     var body: some View {
         NavigationView {
@@ -31,25 +35,33 @@ struct MacLoginView: View {
                 } else {
                     Form {
                         Section {
-                            Text("Mac 锁屏时可在这里连接并解锁。冷启动且 FileVault 开启时，先通过 SSH 密码认证解锁磁盘，再完成桌面登录。恢复画面后会自动返回 OpenDisplay。")
+                            Text("USB 登录无需 Wi-Fi：数据线直连 iPad 机身，Mac 需已安装 USB 登录服务。冷启动前须关闭 FileVault，或先解锁磁盘。登录后自动恢复 OpenDisplay。")
+                            Picker("连接方式", selection: $connectionMode) {
+                                Text("USB 数据线").tag(MacLoginConnectionMode.usb.rawValue)
+                                Text("局域网").tag(MacLoginConnectionMode.network.rawValue)
+                            }.pickerStyle(.segmented)
                             inputOnlyToggle
                         }
                         Section(header: Text("Mac 账户")) {
-                            TextField("Mac 局域网 IP 或 .local 名称", text: $host)
-                                .textInputAutocapitalization(.never).autocorrectionDisabled()
-                                .keyboardType(.URL).accessibilityIdentifier("macLoginHost")
+                            if mode == .network {
+                                TextField("Mac 局域网 IP 或 .local 名称", text: $host)
+                                    .textInputAutocapitalization(.never).autocorrectionDisabled()
+                                    .keyboardType(.URL).accessibilityIdentifier("macLoginHost")
+                            }
                             TextField("Mac 用户名", text: $username)
                                 .textInputAutocapitalization(.never).autocorrectionDisabled()
                                 .accessibilityIdentifier("macLoginUsername")
                             SecureField("Mac 登录密码", text: $password)
                                 .textContentType(.password).accessibilityIdentifier("macLoginPassword")
                         }
-                        Section(footer: Text("使用 Mac 已开启的屏幕共享（端口 5900）。只保存地址和用户名，密码不保存。两台设备需在可互访的局域网内。")) {
+                        Section(footer: Text(mode == .usb
+                            ? "使用已信任的 USB 数据线和 Mac 屏幕共享。无需地址或互联网；只保存用户名，密码不保存。"
+                            : "使用 Mac 屏幕共享（端口 5900）。两端需能在局域网互访；只保存地址和用户名，密码不保存。")) {
                             Button("连接登录画面") {
-                                session.begin(host: host, username: username, password: password)
+                                session.begin(host: host, username: username, password: password, mode: mode)
                                 password = ""
                             }
-                            .disabled(host.trimmingCharacters(in: .whitespacesAndNewlines).isEmpty
+                            .disabled((mode == .network && MacLoginEndpoint(host) == nil)
                                       || username.isEmpty || password.isEmpty)
                             .accessibilityIdentifier("macLoginConnect")
                         }
@@ -100,13 +112,19 @@ struct MacLoginEndpoint: Equatable {
     }
 }
 
-/// Queue-confined, back-pressured byte transport. No listener or new Mac daemon.
+enum MacLoginConnectionMode: String {
+    case usb, network
+}
+
+/// Queue-confined, back-pressured byte transport. USB accepts the Mac relay
+/// through usbmuxd on loopback only; it never falls back to a LAN destination.
 enum MacLoginTransportEnd {
     case network(NWError)
     case timedOut
     case serverClosed
     case queueLimit
     case cancelled
+    case invalidUSBRelay
 
     func message(host: String, connected: Bool) -> String {
         switch self {
@@ -122,6 +140,8 @@ enum MacLoginTransportEnd {
             return "登录连接发送积压过多，已停止；请重新连接。"
         case .cancelled:
             return "登录连接已关闭。"
+        case .invalidUSBRelay:
+            return "USB 登录服务版本不兼容，请更新 Mac USB 登录服务。"
         }
     }
 
@@ -132,13 +152,18 @@ enum MacLoginTransportEnd {
         case .serverClosed: return "server-closed"
         case .queueLimit: return "send-queue-limit"
         case .cancelled: return "cancelled"
+        case .invalidUSBRelay: return "invalid-usb-relay"
         }
     }
 }
 
 final class MacLoginTransport {
     private let queue = DispatchQueue(label: "opendisplay.mac-login")
-    private let connection: NWConnection
+    static let usbPort: UInt16 = 9003
+    static let usbGreeting = Data("ODLOGIN1\n".utf8)
+    private var connection: NWConnection?
+    private var listener: NWListener?
+    private let mode: MacLoginConnectionMode
     private var closed = false
     private var established = false
     private var pendingBytes = 0
@@ -146,7 +171,9 @@ final class MacLoginTransport {
     var onBytes: ((Data, @escaping () -> Void) -> Void)?
     var onClose: ((MacLoginTransportEnd) -> Void)?
 
-    init(endpoint: MacLoginEndpoint) {
+    init(endpoint: MacLoginEndpoint?, mode: MacLoginConnectionMode = .network) {
+        self.mode = mode
+        guard mode == .network, let endpoint else { return }
         let tcp = NWProtocolTCP.Options()
         tcp.noDelay = true
         let parameters = NWParameters(tls: nil, tcp: tcp)
@@ -154,28 +181,75 @@ final class MacLoginTransport {
         connection = NWConnection(host: NWEndpoint.Host(endpoint.host), port: 5900, using: parameters)
     }
 
-    deinit { connection.cancel() }
+    deinit { connection?.cancel(); listener?.cancel() }
 
     func start() {
-        connection.stateUpdateHandler = { [weak self] state in
+        queue.async { [weak self] in
             guard let self, !self.closed else { return }
+            if self.mode == .usb { self.listenForUSBRelay() }
+            else if let connection = self.connection { self.startConnection(connection) }
+            self.queue.asyncAfter(deadline: .now() + (self.mode == .usb ? 45 : 15)) { [weak self] in
+                guard let self, !self.established else { return }
+                self.finish(.timedOut)
+            }
+        }
+    }
+
+    private func listenForUSBRelay() {
+        let tcp = NWProtocolTCP.Options()
+        tcp.noDelay = true
+        let parameters = NWParameters(tls: nil, tcp: tcp)
+        parameters.allowLocalEndpointReuse = true
+        parameters.requiredLocalEndpoint = .hostPort(host: "127.0.0.1", port: NWEndpoint.Port(rawValue: Self.usbPort)!)
+        do {
+            let listener = try NWListener(using: parameters)
+            self.listener = listener
+            listener.stateUpdateHandler = { [weak self] state in
+                if case .failed(let error) = state { self?.finish(.network(error)) }
+            }
+            listener.newConnectionHandler = { [weak self] connection in
+                guard let self, !self.closed, self.connection == nil,
+                      Self.isLoopback(connection.endpoint) else { connection.cancel(); return }
+                self.connection = connection
+                self.startConnection(connection)
+            }
+            listener.start(queue: queue)
+        } catch let error as NWError { finish(.network(error)) }
+        catch { finish(.invalidUSBRelay) }
+    }
+
+    static func isLoopback(_ endpoint: NWEndpoint) -> Bool {
+        guard case .hostPort(let host, _) = endpoint else { return false }
+        return host == NWEndpoint.Host("127.0.0.1") || host == NWEndpoint.Host("::1")
+    }
+
+    private func startConnection(_ connection: NWConnection) {
+        connection.stateUpdateHandler = { [weak self, weak connection] state in
+            guard let self, let connection, !self.closed, self.connection === connection else { return }
             switch state {
             case .ready:
-                guard !self.established else { return }
-                self.established = true
-                self.onReady?()
+                if self.mode == .usb {
+                    connection.receive(minimumIncompleteLength: Self.usbGreeting.count,
+                                       maximumLength: Self.usbGreeting.count) { [weak self] data, _, _, error in
+                        guard let self, !self.closed else { return }
+                        if let error { self.finish(.network(error)) }
+                        else if data == Self.usbGreeting { self.markReady() }
+                        else { self.finish(.invalidUSBRelay) }
+                    }
+                } else { self.markReady() }
             case .failed(let error): self.finish(.network(error))
-            // A waiting path may recover (for example while Wi-Fi wakes).
-            // The bounded connection deadline below remains in force.
-            case .waiting: break
             default: break
             }
         }
         connection.start(queue: queue)
-        queue.asyncAfter(deadline: .now() + 15) { [weak self] in
-            guard let self, !self.established else { return }
-            self.finish(.timedOut)
-        }
+    }
+
+    private func markReady() {
+        guard !closed, !established else { return }
+        established = true
+        listener?.cancel()
+        listener = nil
+        onReady?()
     }
 
     /// Start reads only after JavaScript has attached its RFB handlers.
@@ -184,7 +258,7 @@ final class MacLoginTransport {
     }
 
     private func readNext() {
-        guard !closed else { return }
+        guard !closed, let connection else { return }
         connection.receive(minimumIncompleteLength: 1, maximumLength: 64 * 1024) { [weak self] data, _, complete, error in
             guard let self, !self.closed else { return }
             if let data, !data.isEmpty, let onBytes = self.onBytes {
@@ -204,11 +278,11 @@ final class MacLoginTransport {
 
     func send(_ data: Data) {
         queue.async { [weak self] in
-            guard let self, !self.closed else { return }
+            guard let self, !self.closed, let connection = self.connection else { return }
             guard data.count <= 256 * 1024,
                   self.pendingBytes + data.count <= 1024 * 1024 else { self.finish(.queueLimit); return }
             self.pendingBytes += data.count
-            self.connection.send(content: data, completion: .contentProcessed { [weak self] error in
+            connection.send(content: data, completion: .contentProcessed { [weak self] error in
                 guard let self else { return }
                 self.pendingBytes -= data.count
                 if let error { self.finish(.network(error)) }
@@ -221,8 +295,12 @@ final class MacLoginTransport {
     private func finish(_ reason: MacLoginTransportEnd) {
         guard !closed else { return }
         closed = true
-        connection.stateUpdateHandler = nil
-        connection.cancel()
+        listener?.stateUpdateHandler = nil
+        listener?.newConnectionHandler = nil
+        listener?.cancel()
+        listener = nil
+        connection?.stateUpdateHandler = nil
+        connection?.cancel()
         onClose?(reason)
     }
 }
@@ -234,6 +312,7 @@ final class MacLoginSession: NSObject, ObservableObject {
     @Published private(set) var inputOnly = true
     private(set) var visible = true
     private var endpoint: MacLoginEndpoint?
+    private(set) var mode: MacLoginConnectionMode = .network
     private var credentials: [String: String]?
     private var transport: MacLoginTransport?
     private var tcpConnected = false
@@ -243,17 +322,28 @@ final class MacLoginSession: NSObject, ObservableObject {
     // Keep its encrypted session alive during foreground OpenDisplay use.
     private(set) var webView: WKWebView?
 
-    func begin(host: String, username: String, password: String) {
-        guard let endpoint = MacLoginEndpoint(host), !username.isEmpty, !password.isEmpty else {
+    override init() {
+        super.init()
+        #if DEBUG
+        if ProcessInfo.processInfo.arguments.contains("-usbLoginProbe") {
+            Task { await USBLoginProbe.run() }
+        }
+        #endif
+    }
+
+    func begin(host: String, username: String, password: String, mode: MacLoginConnectionMode = .network) {
+        let endpoint = MacLoginEndpoint(host)
+        guard (mode == .usb || endpoint != nil), !username.isEmpty, !password.isEmpty else {
             status = "请填写 Mac 的 IP 或主机名、用户名和登录密码。"
             return
         }
         cancel()
         visible = true
         self.endpoint = endpoint
+        self.mode = mode
         tcpConnected = false
         credentials = ["username": username, "password": password]
-        status = "正在连接 Mac 登录画面…"
+        status = mode == .usb ? "等待 USB 登录服务…请保持数据线直连 iPad 机身。" : "正在连接 Mac 登录画面…"
         started = true
     }
 
@@ -324,9 +414,9 @@ final class MacLoginSession: NSObject, ObservableObject {
     }
 
     private func connect() {
-        guard transport == nil, let endpoint, credentials != nil else { return }
+        guard transport == nil, (mode == .usb || endpoint != nil), credentials != nil else { return }
         let token = generation
-        let socket = MacLoginTransport(endpoint: endpoint)
+        let socket = MacLoginTransport(endpoint: endpoint, mode: mode)
         transport = socket
         socket.onReady = { [weak self, weak socket] in
             DispatchQueue.main.async {
@@ -358,7 +448,11 @@ final class MacLoginSession: NSObject, ObservableObject {
             DispatchQueue.main.async {
                 guard let self, self.generation == token else { return }
                 Log.info("Mac login transport ended: \(reason.diagnosticCode), tcpConnected=\(self.tcpConnected)")
-                self.fail(reason.message(host: endpoint.host, connected: self.tcpConnected))
+                if self.mode == .usb, !self.tcpConnected {
+                    self.fail("USB 登录尚未建立。请确认数据线直连 iPad 机身、已信任 Mac，且 Mac 的 USB 登录服务已安装并运行。冷启动须关闭 FileVault 或先解锁磁盘。")
+                } else {
+                    self.fail(reason.message(host: self.endpoint?.host ?? "USB Mac", connected: self.tcpConnected))
+                }
             }
         }
         socket.start()
@@ -415,3 +509,75 @@ private struct MacLoginWebView: UIViewRepresentable {
     func updateUIView(_ uiView: WKWebView, context: Context) {}
     // Removing the view during handoff must not stop its authenticated session.
 }
+
+#if DEBUG
+/// Developer-only real-device check: negotiate RFB through the USB relay,
+/// then close before selecting authentication. Never sends credentials/input.
+@MainActor
+private final class USBLoginProbe {
+    private var transport: MacLoginTransport?
+    private var bytes: [UInt8] = []
+    private var greeted = false
+    private var done = false
+    private var completion: (() -> Void)?
+
+    static func run() async {
+        let probe = USBLoginProbe()
+        await probe.perform()
+    }
+
+    private func perform() async {
+        await withCheckedContinuation { continuation in
+            completion = { continuation.resume() }
+            let transport = MacLoginTransport(endpoint: nil, mode: .usb)
+            self.transport = transport
+            transport.onReady = { [weak self] in
+                DispatchQueue.main.async { self?.transport?.receive() }
+            }
+            transport.onBytes = { [weak self] data, consumed in
+                DispatchQueue.main.async {
+                    self?.accept(data)
+                    consumed()
+                }
+            }
+            transport.onClose = { [weak self] reason in
+                DispatchQueue.main.async { self?.finish("failed: \(reason.diagnosticCode)") }
+            }
+            Log.info("USB login probe: started (no credentials or input)")
+            transport.start()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 20) { [weak self] in
+                self?.finish("failed: probe timeout")
+            }
+        }
+    }
+
+    private func accept(_ data: Data) {
+        guard !done else { return }
+        bytes.append(contentsOf: data)
+        if !greeted {
+            guard bytes.count >= 12 else { return }
+            guard Array(bytes.prefix(12)) == Array("RFB 003.889\n".utf8) else {
+                finish("failed: unexpected RFB greeting"); return
+            }
+            bytes.removeFirst(12)
+            greeted = true
+            transport?.send(Data("RFB 003.889\n".utf8))
+        }
+        guard let count = bytes.first else { return }
+        guard count > 0, count <= 64 else { finish("failed: invalid RFB security offer"); return }
+        if bytes.count >= Int(count) + 1 {
+            finish("passed: USB RFB greeting and bidirectional negotiation (security types=\(count))")
+        }
+    }
+
+    private func finish(_ result: String) {
+        guard !done else { return }
+        done = true
+        Log.info("USB login probe: \(result)")
+        transport?.cancel()
+        transport = nil
+        completion?()
+        completion = nil
+    }
+}
+#endif
