@@ -77,6 +77,15 @@ lock/unlock. Keep a local keyboard/display available for the first acceptance.
 The current live desktop must not be rebooted or logged out automatically by
 the build or installation scripts.
 
+On 2026-11-16 the user confirmed the requested USB-only cold-start acceptance
+on the M4 Mac mini and 11-inch M1 iPad Pro: Wi-Fi/Ethernet are unnecessary for
+the login path, with FileVault off and automatic login off. Read-only checks
+confirmed a new Mac boot at 16:34:30 Asia/Shanghai, system relay startup at
+16:34:38, and a USB login pipe at 16:41:50. This acceptance covers login and
+handoff to desktop streaming/keyboard/trackpad. It does not establish FileVault
+pre-unlock support or forced-process-exit recovery; the latter has not been
+tested against the retained authenticated session.
+
 ## Remove the relay
 
 ```sh
