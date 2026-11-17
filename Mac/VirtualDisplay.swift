@@ -102,7 +102,7 @@ final class VirtualDisplay {
                 // removing the display — never hold it across the sleep.
                 do {
                     guard let self else { return }
-                    if self.resizesInFlight == 0 {
+                    if self.resizesInFlight == 0, self.configurationIsAvailable() {
                         self.ensureNotMirrored()
                         if self.selectTargetMode(recover: settled) { settled = true }
                         self.manageOrigin()
@@ -153,11 +153,16 @@ final class VirtualDisplay {
         self.pointsHigh = pointsHigh
         self.scale = scale
         // A new mode gets a fresh chance: refusals belonged to the old size.
-        hidpiRefusals = 0
-        hidpiRetryAfter = .distantPast
+        modeRetry.reset()
 
         guard let origin else {
             Log.info("virtual display \(display.displayID) resized to \(pointsWide)x\(pointsHigh)pt @\(scale)x")
+            return true
+        }
+        guard configurationIsAvailable() else {
+            // Keep the requested placement for the first interactive tick;
+            // locked WindowServer transactions can block for ten seconds.
+            originRestore.rearm(at: origin)
             return true
         }
         // WindowServer re-places the display on its own once the new mode
@@ -202,6 +207,27 @@ final class VirtualDisplay {
     /// Non-zero while `resize` waits for WindowServer's placement.
     private var resizesInFlight = 0
 
+    private var configurationWasDeferred = false
+
+    /// Do not turn temporary lock/sleep failures into a mode-support verdict.
+    /// Reset the retry deadline too, so waking never waits out an old backoff.
+    private func configurationIsAvailable() -> Bool {
+        guard DisplayConfigurationAvailability.current.canConfigure else {
+            if !configurationWasDeferred {
+                Log.info("display \(display.displayID) mode enforcement deferred while console is locked, asleep or inactive")
+            }
+            configurationWasDeferred = true
+            modeRetry.reset()
+            return false
+        }
+        if configurationWasDeferred {
+            configurationWasDeferred = false
+            modeRetry.reset()
+            Log.info("display \(display.displayID) mode enforcement resumed with a fresh retry budget")
+        }
+        return true
+    }
+
     /// Returns true when the display is (now) in its mode at `scale` (HiDPI
     /// for a 2x display, the 1x mode otherwise), or when there
     /// is nothing left to try for now. Silent when nothing needed doing — this
@@ -219,7 +245,8 @@ final class VirtualDisplay {
     /// settle, and probe again only occasionally in case the mode list changes.
     @discardableResult
     private func selectTargetMode(recover: Bool = false) -> Bool {
-        guard Date() >= hidpiRetryAfter else { return true }
+        guard configurationIsAvailable() else { return false }
+        guard Date() >= modeRetry.retryAfter else { return true }
         let opts = [kCGDisplayShowDuplicateLowResolutionModes: kCFBooleanTrue] as CFDictionary
         guard let modes = CGDisplayCopyAllDisplayModes(display.displayID, opts) as? [CGDisplayMode],
               let hidpi = modes.first(where: {
@@ -232,16 +259,17 @@ final class VirtualDisplay {
                 // Same back-off as a refusal: a mode list that stays without
                 // our @2x entry would otherwise be re-applied and logged every
                 // 2s for as long as the display lives.
-                hidpiRefusals += 1
-                if hidpiRefusals <= Self.hidpiRefusalsBeforeBackoff {
+                guard modeRetry.failed(canConfigure: DisplayConfigurationAvailability.current.canConfigure)
+                else { return false }
+                if modeRetry.failures <= DisplayModeRetry.failureLimit {
                     Log.info("@\(scale)x mode vanished from display \(display.displayID) — re-applying settings"
-                        + (hidpiRefusals == Self.hidpiRefusalsBeforeBackoff
-                           ? " (probing again every \(Int(Self.hidpiRetryInterval))s from now)" : ""))
+                        + (modeRetry.failures == DisplayModeRetry.failureLimit
+                           ? " (probing again every \(Int(DisplayModeRetry.retryInterval))s from now)" : ""))
                 }
                 _ = display.apply(settings)
-                if hidpiRefusals == Self.hidpiRefusalsBeforeBackoff { reportRefusal() }
-                if hidpiRefusals >= Self.hidpiRefusalsBeforeBackoff {
-                    hidpiRetryAfter = Date().addingTimeInterval(Self.hidpiRetryInterval)
+                guard configurationIsAvailable() else { return false }
+                if modeRetry.failures == DisplayModeRetry.failureLimit { reportRefusal() }
+                if modeRetry.failures >= DisplayModeRetry.failureLimit {
                     return true
                 }
             }
@@ -250,30 +278,36 @@ final class VirtualDisplay {
         if let current = CGDisplayCopyDisplayMode(display.displayID),
            current.width == hidpi.width, current.height == hidpi.height,
            current.pixelWidth == hidpi.pixelWidth, current.pixelHeight == hidpi.pixelHeight {
-            hidpiRefusals = 0   // WindowServer may have restored it for us
+            modeRetry.reset()   // WindowServer may have restored it for us
             return true
         }
         var config: CGDisplayConfigRef?
-        CGBeginDisplayConfiguration(&config)
-        CGConfigureDisplayWithDisplayMode(config, display.displayID, hidpi, nil)
-        let err = CGCompleteDisplayConfiguration(config, .permanently)
+        var err = CGBeginDisplayConfiguration(&config)
         if err == .success {
-            hidpiRefusals = 0
+            err = CGConfigureDisplayWithDisplayMode(config, display.displayID, hidpi, nil)
+            if err == .success {
+                err = CGCompleteDisplayConfiguration(config, .permanently)
+            } else {
+                CGCancelDisplayConfiguration(config)
+            }
+        }
+        if err == .success {
+            modeRetry.reset()
             Log.info("display mode (re)selected: \(hidpi.width)x\(hidpi.height)@\(scale)x (result 0)")
             return true
         }
-        hidpiRefusals += 1
-        if hidpiRefusals < Self.hidpiRefusalsBeforeBackoff {
+        guard configurationIsAvailable(),
+              modeRetry.failed(canConfigure: true) else { return false }
+        if modeRetry.failures < DisplayModeRetry.failureLimit {
             Log.info("display mode (re)selected: \(hidpi.width)x\(hidpi.height)@\(scale)x (result \(err.rawValue))")
             return false
         }
-        if hidpiRefusals == Self.hidpiRefusalsBeforeBackoff {
+        if modeRetry.failures == DisplayModeRetry.failureLimit {
             Log.info("macOS refused the @\(scale)x mode \(hidpi.width)x\(hidpi.height) "
-                + "\(hidpiRefusals) times (result \(err.rawValue)) — leaving display "
-                + "\(display.displayID) in its current mode, probing again every \(Int(Self.hidpiRetryInterval))s")
+                + "\(modeRetry.failures) times (result \(err.rawValue)) — leaving display "
+                + "\(display.displayID) in its current mode, probing again every \(Int(DisplayModeRetry.retryInterval))s")
             reportRefusal()
         }
-        hidpiRetryAfter = Date().addingTimeInterval(Self.hidpiRetryInterval)
         return true
     }
 
@@ -282,12 +316,7 @@ final class VirtualDisplay {
         onModeRefused?(VirtualCanvasSize(pointsWide: pointsWide, pointsHigh: pointsHigh, scale: scale))
     }
 
-    /// Consecutive `CGCompleteDisplayConfiguration` failures for the target mode.
-    private var hidpiRefusals = 0
-    /// While in the future, `selectTargetMode` does nothing and reports settled.
-    private var hidpiRetryAfter = Date.distantPast
-    private static let hidpiRefusalsBeforeBackoff = 5
-    private static let hidpiRetryInterval: TimeInterval = 30
+    private var modeRetry = DisplayModeRetry()
 
     /// Arrangement restore + observation (#116): enforce the caller's
     /// device-keyed origin while macOS may still restore its own stale record

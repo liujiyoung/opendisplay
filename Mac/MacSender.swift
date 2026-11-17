@@ -546,7 +546,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Store a new choice and resize this session's display in place.
     func setDisplaySize(_ size: DisplaySize, for info: PhoneInfo) {
         let key = displaySizeKey(for: info)
-        guard DisplaySizeStore.load(key: key) != size else { return }
+        pipelineLock.lock()
+        let retryingMode = refusedDesktopsStorage.reset()
+        pipelineLock.unlock()
+        guard DisplaySizeStore.load(key: key) != size || retryingMode else { return }
         DisplaySizeStore.save(size, key: key)
         Log.info("display size set to \(size.rawValue) for \(key)")
         guard mode == .extend else { return }
@@ -572,11 +575,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    /// 2x desktops macOS refused on this session's display (#292); the
-    /// desktop policy runs the 1x fallback instead of any of them.
+    /// 2x desktops refused during this interactive-console period (#292).
+    /// Wake/unlock or an explicit size selection grants them a fresh attempt.
     /// Written from the display's enforcement loop, read from capture and
     /// control paths, so it lives under `pipelineLock`.
-    private var refusedDesktopsStorage: Set<VirtualCanvasSize> = []
+    private var refusedDesktopsStorage = RefusedDisplayModes()
 
     private func isRefused(_ desktop: VirtualCanvasSize) -> Bool {
         pipelineLock.lock(); defer { pipelineLock.unlock() }
@@ -585,14 +588,29 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     /// Runs on `queue`, where `lastHello` lives.
     private func modeRefused(_ refused: VirtualCanvasSize, info: PhoneInfo) {
+        let canConfigure = DisplayConfigurationAvailability.current.canConfigure
         pipelineLock.lock()
-        let inserted = refusedDesktopsStorage.insert(refused).inserted
+        let inserted = refusedDesktopsStorage.insert(refused, canConfigure: canConfigure)
         pipelineLock.unlock()
         guard inserted else { return }
         let fallback = DesktopPolicy.oneXFallback(facts: info.facts).desktop
         Log.info("macOS refused \(refused.pointsWide)x\(refused.pointsHigh) @2x, running "
             + "\(fallback.pointsWide)x\(fallback.pointsHigh) @1x")
         scheduleCanvasRebuild()
+    }
+
+    /// On `queue`, including when the transport is temporarily disconnected.
+    private func refreshDisplayModeRecovery() {
+        let available = DisplayConfigurationAvailability.current.canConfigure
+        pipelineLock.lock()
+        let cleared = refusedDesktopsStorage.observeConsole(available: available)
+        pipelineLock.unlock()
+        if cleared {
+            Log.info("console resumed — cleared refused display modes; retrying the selected desktop size")
+        }
+        if available, mode == .extend, cleared || canvasNeedsRebuild {
+            scheduleCanvasRebuild()
+        }
     }
 
     /// Log once per session that a receiver's `panel` failed validation.
@@ -1021,6 +1039,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         Task {
             try? await Task.sleep(for: .milliseconds(300))
             guard let info = self.lastHello, self.canvasNeedsRebuild else { return }
+            // Keep the request pending until WindowServer can apply it. The
+            // console monitor resumes it even if capture never stopped.
+            guard self.consoleCanCapture else { return }
             // Still in setup: `start()` picks the flag up once setupExtend
             // returns, so a second capture path never starts beside it.
             guard self.stream != nil else { return }
@@ -2265,6 +2286,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func schedulePing() {
         queue.asyncAfter(deadline: .now() + 2.0) { [weak self] in
             guard let self, !self.stopped else { return }
+            self.refreshDisplayModeRecovery()
             if self.connectionReady {
                 self.updateAdaptiveVideoBitrate()
                 // Liveness + send-side health for the phone's overlay.
