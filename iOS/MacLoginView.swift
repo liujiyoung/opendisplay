@@ -319,7 +319,8 @@ final class MacLoginSession: NSObject, ObservableObject {
     private(set) var generation = UUID()
     // Owned by the receiver screen, not the presented login view. Disconnecting
     // the last Screen Sharing viewer can re-lock the console it just unlocked.
-    // Keep its encrypted session alive during foreground OpenDisplay use.
+    // Keep its encrypted session alive after handing off to the desktop,
+    // including when the system opens Sidecar over this app.
     private(set) var webView: WKWebView?
 
     override init() {
@@ -366,6 +367,15 @@ final class MacLoginSession: NSObject, ObservableObject {
     func resumeLogin() {
         visible = true
         webView?.evaluateJavaScript("window.openDisplayLogin?.setVisible(true)", completionHandler: nil)
+    }
+
+    func appWillResignActive() {
+        // A hidden, authenticated viewer already has video and input paused.
+        // Closing it during an app switch can lock the Mac the moment Sidecar
+        // opens. An unfinished or visible login is still cancelled. The app
+        // separately cancels all logins on device lock and termination.
+        guard authenticated, !visible else { cancel(); return }
+        Log.info("Mac login: retaining paused authenticated session during app switch")
     }
 
     func leaveLogin() {

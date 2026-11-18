@@ -54,6 +54,7 @@ def main():
     subprocess.run(['xcrun', 'swiftc', '-O', '-module-cache-path',
                     '/private/tmp/opendisplay-swift-cache',
                     str(ROOT / 'tools/usb-login/main.swift'), str(ROOT / 'Mac/Usbmux.swift'),
+                    str(ROOT / 'Mac/LoginStreamLease.swift'),
                     '-o', str(binary)], check=True)
     subprocess.run(['codesign', '--force', '--sign', '-', '--identifier', LABEL, str(binary)], check=True)
     subprocess.run(['codesign', '--verify', '--strict', str(binary)], check=True)
@@ -99,7 +100,7 @@ if [ -L '/Library/Logs/OpenDisplay USB Login/relay.log' ]; then exit 1; fi
     # Exclude Finder/resource-fork metadata from this four-file local package.
     subprocess.run(['xattr', '-cr', str(stage)], check=True)
     subprocess.run(['pkgbuild', '--root', str(stage), '--scripts', str(scripts),
-                    '--identifier', LABEL, '--version', '1.0.1', '--ownership', 'recommended',
+                    '--identifier', LABEL, '--version', '1.0.2', '--ownership', 'recommended',
                     '--filter', r'/\._', '--install-location', '/', str(package)],
                    env={**os.environ, 'COPYFILE_DISABLE': '1'}, check=True)
     print(package)

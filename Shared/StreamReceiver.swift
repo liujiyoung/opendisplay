@@ -37,7 +37,7 @@ struct PerfStats: Equatable {
     var encodeP50 = 0.0          // Mac-side capture→socket (encode + queue)
     var rttMs = 0.0              // control-channel round trip
     var e2eSamples: [Double] = []  // last ~120 per-frame e2e latencies, ms
-    var transport = "—"          // USB (loopback via usbmux), Cable (direct link) or WiFi
+    var transport = "—"          // USB, Cable, WiFi, or AWDL
     var codec = ""               // "H.264" or "HEVC" once a stream is known
     var hitches = 0              // gaps over 1.5x the median interval (last ~120 frames)
     var cursorPerSec = 0         // cursor position updates applied (this window)
@@ -90,6 +90,7 @@ final class StreamReceiver: ObservableObject {
     var macSupportsPencilWire: Bool { macProtocolVersion >= WireProtocol.pencilWireVersion }
 
     private var listener: NWListener?
+    private var peerWiFiEnabled: Bool
     private var listenerHealthy = false
     private var connection: NWConnection?
     // Cursor side channel: UDP on port+1. Cursor positions ride TCP behind
@@ -317,6 +318,14 @@ final class StreamReceiver: ObservableObject {
         }
     }
 
+    func setPeerWiFiEnabled(_ enabled: Bool) {
+        queue.async {
+            guard self.peerWiFiEnabled != enabled else { return }
+            self.peerWiFiEnabled = enabled
+            if self.listener != nil { self.restartListener() }
+        }
+    }
+
     /// Announce the panel this receiver renders onto. Called before start()
     /// and again whenever it changes (iOS window resizes, macOS
     /// display-mode changes) — a live connection re-sends hello so the sender
@@ -380,11 +389,12 @@ final class StreamReceiver: ObservableObject {
     init(displayLayer: AVSampleBufferDisplayLayer, deviceKind: String,
          fallbackServiceName: String,
          maxEncodeWide: Int? = nil, maxEncodeHigh: Int? = nil,
-         hevcCapability: VideoCapability? = nil) {
+         hevcCapability: VideoCapability? = nil, peerWiFiEnabled: Bool = false) {
         self.displayLayer = displayLayer
         self.hevcCapability = hevcCapability
         self.deviceKind = deviceKind
         self.fallbackServiceName = fallbackServiceName
+        self.peerWiFiEnabled = peerWiFiEnabled
         self.maxEncodeWide = maxEncodeWide
         self.maxEncodeHigh = maxEncodeHigh
         displayLayer.videoGravity = .resizeAspect
@@ -631,6 +641,7 @@ final class StreamReceiver: ObservableObject {
             if deviceKind != "Mac" { tcp.maximumSegmentSize = 1200 }
             let params = NWParameters(tls: nil, tcp: tcp)
             params.allowLocalEndpointReuse = true
+            params.includePeerToPeer = peerWiFiEnabled
             params.serviceClass = .interactiveVideo
             listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: port)!)
             self.listener = listener
@@ -713,7 +724,7 @@ final class StreamReceiver: ObservableObject {
             }
         }
         listener.start(queue: queue)
-        startCursorListener()
+        if cursorListener == nil { startCursorListener() }
         startControlListener()
     }
 
@@ -725,6 +736,9 @@ final class StreamReceiver: ObservableObject {
         tcp.noDelay = true
         let params = NWParameters(tls: nil, tcp: tcp)
         params.allowLocalEndpointReuse = true
+        // No Bonjour advertisement on this port. Sessions must bind with
+        // the one-time token delivered on the video connection.
+        params.includePeerToPeer = deviceKind != "Mac"
         params.serviceClass = .responsiveData
         do {
             let listener = try NWListener(using: params, on: NWEndpoint.Port(rawValue: controlPort)!)
@@ -864,7 +878,12 @@ final class StreamReceiver: ObservableObject {
             // Non-loopback is WiFi only if the path says so: a Mac receiver on
             // a Thunderbolt Bridge or USB-C peer link is a cable too.
             if self.transport != "USB", let path = conn.currentPath {
-                self.transport = path.usesInterfaceType(.wifi) ? "WiFi" : "Cable"
+                if path.remoteEndpoint?.interface?.name == "awdl0"
+                    || path.availableInterfaces.contains(where: { $0.name == "awdl0" }) {
+                    self.transport = "AWDL"
+                } else {
+                    self.transport = path.usesInterfaceType(.wifi) ? "WiFi" : "Cable"
+                }
             }
             self.setConnected(true)
             self.sendHello(on: conn)

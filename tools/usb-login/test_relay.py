@@ -8,6 +8,7 @@ import tempfile
 import threading
 import time
 import unittest
+import uuid
 
 BINARY = Path(__file__).resolve().parents[2] / 'build/usb-login/opendisplay-usb-login-relay'
 
@@ -31,6 +32,74 @@ def receive(sock, count):
 
 
 class RelayTests(unittest.TestCase):
+    def exercise_handoff(self, finish):
+        with tempfile.TemporaryDirectory() as folder, listener() as tablet, listener() as screen:
+            lease_path = Path(folder) / 'face.json'
+            session = str(uuid.uuid4())
+
+            def publish(active=True, owner=session):
+                pending = lease_path.with_suffix('.pending')
+                pending.write_text(json.dumps({'session': owner, 'updatedAt': time.time(), 'active': active}))
+                pending.replace(lease_path)
+
+            publish()
+            process = subprocess.Popen([str(BINARY), '--test-loopback',
+                                        str(tablet.getsockname()[1]),
+                                        str(screen.getsockname()[1]), '--once', folder],
+                                       stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+            try:
+                with tablet.accept()[0] as device, screen.accept()[0] as server:
+                    device.settimeout(5)
+                    self.assertEqual(receive(device, 9), b'ODLOGIN1\n')
+                    device.close()
+                    finish(server, publish)
+                _, log = process.communicate(timeout=5)
+                self.assertEqual(process.returncode, 0, log.decode())
+                self.assertIn(b'retaining local Screen Sharing socket after USB detach', log)
+                return log
+            finally:
+                if process.poll() is None:
+                    process.kill()
+                    process.communicate()
+
+    def test_same_stream_renews_retention_until_it_ends(self):
+        def finish(server, publish):
+            server.settimeout(0.7)
+            for _ in range(8):
+                with self.assertRaises(socket.timeout):
+                    server.recv(1)
+                publish()
+            publish(active=False)
+            server.settimeout(4)
+            self.assertEqual(server.recv(1), b'')
+
+        log = self.exercise_handoff(finish)
+        self.assertIn(b'same receiver resumed streaming', log)
+        self.assertIn(b'stream ended', log)
+
+    def test_handoff_expires_without_a_renewal(self):
+        def finish(server, _publish):
+            server.settimeout(0.7)
+            with self.assertRaises(socket.timeout):
+                server.recv(1)
+            server.settimeout(7)
+            self.assertEqual(server.recv(1), b'')
+
+        log = self.exercise_handoff(finish)
+        self.assertIn(b'stream continuity expired', log)
+
+    def test_different_sender_cannot_keep_the_old_socket(self):
+        def finish(server, publish):
+            server.settimeout(0.7)
+            with self.assertRaises(socket.timeout):
+                server.recv(1)
+            publish(owner=str(uuid.uuid4()))
+            server.settimeout(4)
+            self.assertEqual(server.recv(1), b'')
+
+        log = self.exercise_handoff(finish)
+        self.assertIn(b'stream ended', log)
+
     def test_fragmented_bidirectional_large_transfer_and_peer_close(self):
         # Run twice, on fresh sockets, to catch stale global/connection state.
         for _ in range(2):

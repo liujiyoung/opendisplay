@@ -253,7 +253,7 @@ struct ReceiverScreen: View {
             pointerCapture.enabled = shouldCapturePointer
         }
         .onReceive(NotificationCenter.default.publisher(for: UIApplication.willResignActiveNotification)) { _ in
-            macLoginSession.cancel()
+            macLoginSession.appWillResignActive()
             model.receiver.resetRemoteInput()
             pointerCapture.enabled = false
         }
@@ -476,6 +476,7 @@ struct SettingsView: View {
     @Environment(\.dismiss) private var dismiss
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
+    @AppStorage("peerWiFiEnabled") private var peerWiFiEnabled = false
     // Set once the user tapped "Rate on the App Store": the row is an
     // invitation, not a permanent fixture.
     @AppStorage("rateAppTapped") private var rateAppTapped = false
@@ -510,6 +511,15 @@ struct SettingsView: View {
                         LabeledRow("Stream",
                                    value: "\(Int(receiver.videoSize.width))×\(Int(receiver.videoSize.height)) @ \(receiver.fps) fps")
                     }
+                }
+
+                Section {
+                    Toggle("Wi-Fi 直连", isOn: $peerWiFiEnabled)
+                        .onChange(of: peerWiFiEnabled) { enabled in
+                            receiver.setPeerWiFiEnabled(enabled)
+                        }
+                } footer: {
+                    Text("开启后，可在 Mac 的 OpenDisplay 面板选「Wi-Fi 直连」连接此设备。两端需开启 Wi-Fi，无需加入同一局域网。")
                 }
 
                 Section {
@@ -698,7 +708,8 @@ final class ReceiverModel: ObservableObject {
         self.decodesHEVC = decodesHEVC
         receiver = StreamReceiver(displayLayer: AVSampleBufferDisplayLayer(),
                                   deviceKind: deviceKind,
-                                  fallbackServiceName: UIDevice.current.name)
+                                  fallbackServiceName: UIDevice.current.name,
+                                  peerWiFiEnabled: UserDefaults.standard.bool(forKey: "peerWiFiEnabled"))
         // Seed with the whole screen in landscape; the view replaces it with
         // its window size on first layout, before any Mac connects.
         let native = UIScreen.main.nativeBounds.size   // portrait pixels

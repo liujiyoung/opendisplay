@@ -25,6 +25,7 @@ final class VirtualDisplay {
 
     private var originRestore: OriginRestore
     private let onOriginChange: ((CGPoint, CGSize) -> Void)?
+    private var originBeforeSidecar: CGPoint?
     /// Called once on the main thread when macOS keeps refusing a 2x target
     /// (or keeps dropping it from the mode list), with the refused size. The
     /// display is then running some other mode, so the owner should resize
@@ -105,7 +106,7 @@ final class VirtualDisplay {
                     if self.resizesInFlight == 0, self.configurationIsAvailable() {
                         self.ensureNotMirrored()
                         if self.selectTargetMode(recover: settled) { settled = true }
-                        self.manageOrigin()
+                        if self.originBeforeSidecar == nil { self.manageOrigin() }
                     }
                 }
                 try? await Task.sleep(for: .milliseconds(settled ? 2000 : 200))
@@ -206,6 +207,18 @@ final class VirtualDisplay {
 
     /// Non-zero while `resize` waits for WindowServer's placement.
     private var resizesInFlight = 0
+
+    /// A temporary Sidecar layout should not replace the receiver's saved
+    /// placement or race the origin enforcement from a recent reconnect.
+    @MainActor func suspendOriginTrackingForSidecar() {
+        originBeforeSidecar = CGDisplayBounds(displayID).origin
+    }
+
+    @MainActor func restoreOriginAfterFailedSidecarHandoff() {
+        guard let originBeforeSidecar else { return }
+        self.originBeforeSidecar = nil
+        originRestore.rearm(at: originBeforeSidecar)
+    }
 
     private var configurationWasDeferred = false
 

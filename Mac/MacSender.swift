@@ -27,7 +27,7 @@ enum CaptureMode: String {
 /// How the sender reaches the receiver. Reconnects re-dial from scratch, so
 /// a USB device that was replugged (new usbmuxd DeviceID) is found again.
 enum SenderTransport {
-    case tcp(NWEndpoint)                   // WiFi (Bonjour) or -host/-port override
+    case tcp(NWEndpoint, peerInterface: NWInterface? = nil)
     case usb(udid: String?, port: UInt16)  // native usbmuxd dial; nil = first device
     case accessory(serial: String)         // Android over USB in accessory mode (AOA)
 }
@@ -53,7 +53,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     // Fired once a TCP connection is live, with whether it runs over a
     // wired path (Thunderbolt Bridge / Ethernet) rather than WiFi — the UI
     // labels the row so the user can see the cable is actually in use.
-    @MainActor var onTransportPath: ((_ wired: Bool) -> Void)?
+    @MainActor var onTransportPath: ((_ wired: Bool, _ peerWiFi: Bool) -> Void)?
     // Fired on every hello — carries the receiver's install id so the
     // controller can deduplicate USB/WiFi sessions to the same device.
     @MainActor var onHello: ((PhoneInfo) -> Void)?
@@ -74,6 +74,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var encoder: VTCompressionSession?
     private var connection: NWConnection?
     private var virtualDisplay: VirtualDisplay?
+    @MainActor var displayForSidecarHandoff: VirtualDisplay? { virtualDisplay }
     private let queue = DispatchQueue(label: "sender.video")
     private var controlSocket: ControlSocket?
     private var controlOffer: ControlChannelOffer?
@@ -88,6 +89,13 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private let endpointName: String
     private let mode: CaptureMode
     private let quality: StreamQuality
+    private var peerWiFiInterface: NWInterface? {
+        if case .tcp(_, let interface) = transport { return interface }
+        return nil
+    }
+    private var lanFallback: NWEndpoint?
+    private var peerWiFiProbe: NWConnection?
+    private var peerWiFiRetryAfter: TimeInterval = 0
     private var adaptiveBitrateEnabled: Bool
     private var remoteCapsLock: RemoteCapsLockState
     // Stable per-device serial for the virtual display, so macOS can tell
@@ -192,6 +200,11 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
     private var inputInjector: InputInjector?
     private let remoteUserActivity = RemoteUserActivity()
+    private let loginLeaseSession = UUID()
+    private var loginLeaseDevice: (udid: String, installID: String)?
+    private var loginLeaseActive = false
+    private var lastLoginLeaseUpdate: TimeInterval = -.infinity
+    private lazy var loginLeaseStore = LoginStreamLease.Store.local
 
     // Liveness: both sides ping every 2s; if nothing arrives for 5s the link
     // is half-open (e.g. usbmuxd accepted but the device is gone) — reconnect.
@@ -388,12 +401,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
          quality: StreamQuality = .best,
          adaptiveBitrateEnabled: Bool = AdaptiveVideoBitratePreference.isEnabled(),
          capsLockSwitchesInputSource: Bool = CapsLockInputSourcePreference.isEnabled(),
+         lanFallback: NWEndpoint? = nil,
          displaySerial: UInt32 = 0x0001,
          identityOffset: UInt32 = 0, awaitingWake: Bool = false) {
         self.transport = transport
         self.endpointName = name
         self.mode = mode
         self.quality = quality
+        self.lanFallback = lanFallback
         self.adaptiveBitrateEnabled = adaptiveBitrateEnabled
         self.remoteCapsLock = RemoteCapsLockState(switchesInputSource: capsLockSwitchesInputSource)
         self.displaySerial = displaySerial
@@ -1455,6 +1470,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         queue.async {
             injector?.releaseRemoteInput()
             activity.reset()
+            self.revokeLoginLease()
         }
         invalidateCapturePipeline(discardingLastFrame: true)
         stopCursorPositionEcho()
@@ -1471,6 +1487,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             self?.closeCursorChannel()
             self?.closeControlChannel()
             self?.stopUpgradeProbing()
+            self?.cancelPeerWiFiProbe()
             self?.captureRecoveryWork?.cancel()
             self?.captureRecoveryWork = nil
             // Scheduled from hello handling, which runs on `queue` too.
@@ -1502,32 +1519,108 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     func switchTransport(to newTransport: SenderTransport) {
         queue.async { [weak self] in
             guard let self, !self.stopped else { return }
-            let label = if case .tcp = newTransport { "WiFi" } else { "USB" }
-            Log.info("switching \(self.endpointName) to \(label)")
+            self.cancelPeerWiFiProbe()
             self.transport = newTransport
-            // Fresh grace window: if the new link can't come up either, the
-            // session ends like any other disconnect instead of dialing
-            // a dead transport forever.
+            Log.info("switching \(self.endpointName) to \(self.peerWiFiInterface != nil ? "AWDL" : "preferred route")")
             self.disconnectedSince = Date()
-            self.connectionReady = false
-            self.currentPathDirectLink = false   // the new transport re-classifies
-            self.dialGeneration += 1   // a dial still in flight must not adopt
-            // A delayed cancellation must not close the new connection's
-            // video gate after its ready callback (as in migrate(to:)).
-            self.connection?.stateUpdateHandler = nil
-            self.connection?.viabilityUpdateHandler = nil
-            self.connection?.cancel()
-            self.connection = nil
-            self.closeCursorChannel()
-            self.closeControlChannel()
-            self.stopUpgradeProbing()
-            self.pendingSends = 0
-            self.pendingVideoSendTimes.removeAll()
-            self.pipelineLock.lock()
-            self.pendingEncodes = 0
-            self.pipelineLock.unlock()
+            self.retireTransport()
             self.connect()
         }
+    }
+
+    private func retireTransport() {
+        inputInjector?.releaseRemoteInput()
+        remoteUserActivity.reset()
+        connectionReady = false
+        currentPathDirectLink = false
+        dialGeneration += 1
+        connection?.stateUpdateHandler = nil
+        connection?.viabilityUpdateHandler = nil
+        connection?.cancel()
+        connection = nil
+        closeCursorChannel()
+        closeControlChannel()
+        stopUpgradeProbing()
+        pendingSends = 0
+        pendingVideoSendTimes.removeAll()
+        pipelineLock.lock()
+        pendingEncodes = 0
+        pipelineLock.unlock()
+    }
+
+    func updateLANFallback(_ endpoint: NWEndpoint?) {
+        queue.async { [weak self] in self?.lanFallback = endpoint }
+    }
+
+    func pausePeerWiFiProbing() {
+        queue.async { [weak self] in
+            self?.cancelPeerWiFiProbe()
+            self?.lanFallback = nil
+        }
+    }
+
+    /// The receiver provisionally greets a second TCP connection but retains
+    /// the active stream until the sender sends bytes on the new socket.
+    func preferPeerWiFi(_ endpoint: NWEndpoint, interface: NWInterface, installID: String) {
+        queue.async { [weak self] in
+            guard let self, !self.stopped, self.connectionReady, self.currentPathUsesWiFi,
+                  self.peerWiFiInterface == nil, self.peerWiFiProbe == nil,
+                  self.activeStreamConfigurationSnapshot != nil,
+                  self.lastHello?.id == installID,
+                  ProcessInfo.processInfo.systemUptime >= self.peerWiFiRetryAfter else { return }
+            let probe = NWConnection(to: endpoint, using: self.tcpParameters(peerInterface: interface))
+            self.peerWiFiProbe = probe
+            self.peerWiFiRetryAfter = ProcessInfo.processInfo.systemUptime + 20
+            probe.stateUpdateHandler = { [weak self] state in
+                guard let self, self.peerWiFiProbe === probe else { return }
+                switch state {
+                case .ready:
+                    guard Self.pathUsesPeerInterface(probe.currentPath, interface: interface) else {
+                        self.cancelPeerWiFiProbe()
+                        return
+                    }
+                    self.checkPeerWiFiHello(on: probe, expectedID: installID, endpoint: endpoint, interface: interface)
+                case .waiting, .failed, .cancelled:
+                    self.cancelPeerWiFiProbe()
+                default: break
+                }
+            }
+            probe.start(queue: self.queue)
+            self.queue.asyncAfter(deadline: .now() + 4) { [weak self, weak probe] in
+                guard let self, let probe, self.peerWiFiProbe === probe else { return }
+                self.cancelPeerWiFiProbe()
+            }
+        }
+    }
+
+    private func checkPeerWiFiHello(on probe: NWConnection, expectedID: String,
+                                  endpoint: NWEndpoint, interface: NWInterface) {
+        probe.receive(minimumIncompleteLength: 4, maximumLength: 4) { [weak self] data, _, _, error in
+            guard let self, self.peerWiFiProbe === probe else { return }
+            guard error == nil, let data, data.count == 4 else { self.cancelPeerWiFiProbe(); return }
+            let len = Int(UInt32(bigEndian: data.withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }))
+            guard len > 0, len < 1 << 20 else { self.cancelPeerWiFiProbe(); return }
+            probe.receive(minimumIncompleteLength: len, maximumLength: len) { [weak self] payload, _, _, error in
+                guard let self, self.peerWiFiProbe === probe else { return }
+                guard error == nil, let payload, payload.count == len,
+                      let hello = try? JSONDecoder().decode(PhoneInfo.self, from: payload),
+                      hello.id == expectedID, self.connectionReady else {
+                    self.cancelPeerWiFiProbe()
+                    return
+                }
+                self.peerWiFiProbe = nil
+                self.transport = .tcp(endpoint, peerInterface: interface)
+                Log.info("upgrading active stream to Wi-Fi direct via \(interface.name)")
+                self.migrate(to: probe)
+            }
+        }
+    }
+
+    private func cancelPeerWiFiProbe() {
+        let probe = peerWiFiProbe
+        peerWiFiProbe = nil
+        probe?.stateUpdateHandler = nil
+        probe?.cancel()
     }
 
     // The controller's end() is idempotent, but several detectors (grace,
@@ -1566,7 +1659,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// hello arrives: a fresh dial reaches ready before the first hello
     /// names the device.
     private func refreshDirectLinkClassification(for conn: NWConnection) {
-        guard connection === conn, case .tcp = transport,
+        guard connection === conn, case .tcp = transport, peerWiFiInterface == nil,
               lastHello?.device == "Mac",
               let path = conn.currentPath else {
             currentPathDirectLink = false
@@ -1718,7 +1811,44 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             reportedScreenLocked = locked
             Log.info("Mac screen lock state: \(locked)")
         }
+        if locked { revokeLoginLease() }
         return locked
+    }
+
+    /// Render reports and deliberate input come from the active iPad
+    /// pipeline. Remember its real USB identity before going wireless.
+    private func reportLoginStreamActivity() {
+        let now = ProcessInfo.processInfo.systemUptime
+        guard now - lastLoginLeaseUpdate >= 2,
+              connectionReady, helloSeenOnConnection,
+              let hello = lastHello, let id = hello.id,
+              hello.device == "iPad" || hello.device == "iPhone",
+              !screenLockedForPeer(), consoleIsInteractive else { return }
+        if case .usb(let udid?, _) = transport {
+            if loginLeaseDevice?.udid != udid { revokeLoginLease() }
+            loginLeaseDevice = (udid, id)
+        }
+        guard let binding = loginLeaseDevice, binding.installID == id,
+              let store = loginLeaseStore else { return }
+        do {
+            try store.write(LoginStreamLease(session: loginLeaseSession,
+                                            updatedAt: Date().timeIntervalSince1970, active: true),
+                            udid: binding.udid)
+            loginLeaseActive = true
+            lastLoginLeaseUpdate = now
+        } catch {
+            Log.info("could not update USB login continuity: \(error.localizedDescription)")
+        }
+    }
+
+    private func revokeLoginLease() {
+        guard loginLeaseActive, let binding = loginLeaseDevice else { return }
+        loginLeaseActive = false
+        lastLoginLeaseUpdate = -.infinity
+        guard let store = loginLeaseStore, store.read(udid: binding.udid)?.session == loginLeaseSession else { return }
+        try? store.write(LoginStreamLease(session: loginLeaseSession,
+                                         updatedAt: Date().timeIntervalSince1970, active: false),
+                         udid: binding.udid)
     }
 
     /// Whether a recovery attempt can succeed right now. SCK finds no
@@ -1767,7 +1897,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func connect() {
         guard !stopped else { return }
         switch transport {
-        case .tcp(let endpoint): connectTCP(endpoint)
+        case .tcp(let endpoint, _): connectTCP(endpoint)
         case .usb(let udid, let port):
             connectWired { (try await Usbmux.dial(udid: udid, port: port, queue: self.queue), nil) }
         case .accessory(let serial):
@@ -1834,12 +1964,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         receiveControl(on: conn)
         refreshDirectLinkClassification(for: conn)
         if let path = conn.currentPath {
-            let wired = !path.usesInterfaceType(.wifi) && !path.usesInterfaceType(.loopback)
+            let wired = peerWiFiInterface == nil
+                && !path.usesInterfaceType(.wifi) && !path.usesInterfaceType(.loopback)
                 && !path.usesInterfaceType(.cellular)
-            currentPathUsesWiFi = path.usesInterfaceType(.wifi)
+            currentPathUsesWiFi = peerWiFiInterface != nil || path.usesInterfaceType(.wifi)
             let names = path.availableInterfaces.map(\.name).joined(separator: ",")
             Log.info("connection path to \(endpointName): \(names) wired=\(wired) direct=\(currentPathDirectLink)")
-            Task { @MainActor in self.onTransportPath?(wired) }
+            let peerWiFi = peerWiFiInterface != nil
+            Task { @MainActor in self.onTransportPath?(wired, peerWiFi) }
         }
         resetAdaptiveVideoBitrate()
         // -forceUpgradeProbe YES: dev knob — loopback runs never look like
@@ -1857,6 +1989,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Arm the periodic probe. Cheap when there is nothing to find: with no
     /// advertised addresses, or on the USB transport, it never fires a dial.
     private func startUpgradeProbing() {
+        guard peerWiFiInterface == nil else { return }
         lastLoggedCandidates = []
         upgradeTimer?.cancel()
         let timer = DispatchSource.makeTimerSource(queue: queue)
@@ -1894,6 +2027,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// interface for link-local IPv6) with WiFi forbidden. mDNS resolution
     /// stalls under interface restrictions; literal addresses do not.
     private func probeForCablePath(force: Bool = false) {
+        guard peerWiFiInterface == nil else { return }
         guard !stopped, connectionReady,
               currentPathUsesWiFi || UserDefaults.standard.bool(forKey: "forceUpgradeProbe"),
               case .tcp = transport, !peerAddrs.isEmpty else { return }
@@ -1980,23 +2114,10 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     private func migrate(to conn: NWConnection) {
         let names = conn.currentPath?.availableInterfaces.map(\.name)
             .joined(separator: ",") ?? "?"
-        Log.info("cable path answered (\(names)) — migrating the session off WiFi")
+        Log.info("preferred path answered (\(names)) — migrating the session")
         upgradeProbes.removeAll { $0 === conn }
-        stopUpgradeProbing()
-        dialGeneration += 1   // a redial in flight must not clobber this
-        closeCursorChannel()  // rebuilt from the next hello on the new path
-        // Close the video gate before publishing the new socket. Encoded
-        // callbacks deliver on `queue` and carry the old connection generation,
-        // so anything already in flight is either sent on WiFi before this
-        // method runs or discarded after the generation advances below.
-        connectionReady = false
-        // Detach the old connection's handler BEFORE cancelling: its
-        // .cancelled callback arrives after becomeReady below and would
-        // reset connectionReady, silently blackholing every send on the
-        // migrated connection.
-        connection?.stateUpdateHandler = nil
-        connection?.viabilityUpdateHandler = nil
-        connection?.cancel()
+        cancelPeerWiFiProbe()
+        retireTransport()
         connection = conn
         conn.stateUpdateHandler = { [weak self] state in
             guard let self, self.connection === conn else { return }
@@ -2048,7 +2169,18 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         return result
     }
 
-    private func connectTCP(_ endpoint: NWEndpoint, allowingIPv6: Bool = false) {
+    private func restrictToPeerWiFi(_ params: NWParameters) {
+        guard let peerWiFiInterface else { return }
+        params.includePeerToPeer = true
+        params.requiredInterface = peerWiFiInterface
+    }
+
+    private static func pathUsesPeerInterface(_ path: NWPath?, interface: NWInterface) -> Bool {
+        path?.remoteEndpoint?.interface?.name == interface.name
+            || path?.availableInterfaces.contains(where: { $0.name == interface.name }) == true
+    }
+
+    private func tcpParameters(peerInterface: NWInterface?) -> NWParameters {
         let options = NWProtocolTCP.Options()
         options.noDelay = true   // latency matters more than throughput here
         if lastHello?.device != "Mac" {
@@ -2068,11 +2200,20 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // proxy can otherwise accept on lo0 and close before the peer's hello,
         // or make a WiFi connection look like a direct cable to path detection.
         params.preferNoProxies = true
+        if let peerInterface {
+            params.includePeerToPeer = true
+            params.requiredInterface = peerInterface
+        }
         params.serviceClass = .interactiveVideo
+        return params
+    }
+
+    private func connectTCP(_ endpoint: NWEndpoint, allowingIPv6: Bool = false) {
+        let params = tcpParameters(peerInterface: peerWiFiInterface)
         let mobileBonjour: Bool
         if case .service = endpoint { mobileBonjour = lastHello?.device != "Mac" }
         else { mobileBonjour = false }
-        let tryingIPv4 = mobileBonjour && !allowingIPv6
+        let tryingIPv4 = peerWiFiInterface == nil && mobileBonjour && !allowingIPv6
         if tryingIPv4, let ip = params.defaultProtocolStack.internetProtocol as? NWProtocolIP.Options {
             ip.version = .v4
         }
@@ -2106,6 +2247,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             guard let self, !self.stopped, self.connection === conn else { return }
             switch state {
             case .ready:
+                if let interface = self.peerWiFiInterface {
+                    guard Self.pathUsesPeerInterface(conn.currentPath, interface: interface) else {
+                        Log.info("direct Wi-Fi did not confirm \(interface.name) — redialing")
+                        self.scheduleReconnect()
+                        return
+                    }
+                    Log.info("direct Wi-Fi established via \(interface.name)")
+                }
                 established = true
                 if tryingIPv4 { Log.info("mobile receiver connected using IPv4") }
                 self.becomeReady(conn)
@@ -2241,6 +2390,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
 
     private func scheduleReconnect() {
         guard !stopped else { return }
+        cancelPeerWiFiProbe()
+        if peerWiFiInterface != nil, let lanFallback {
+            peerWiFiRetryAfter = ProcessInfo.processInfo.systemUptime + 20
+            transport = .tcp(lanFallback)
+            Log.info("Wi-Fi direct interrupted — trying the receiver on the LAN")
+        }
         inputInjector?.releaseRemoteInput()
         remoteUserActivity.reset()
         if everConnected {
@@ -2481,6 +2636,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         closeCursorChannel()
         let params = NWParameters.udp
         params.preferNoProxies = true // the cursor uses the same direct LAN path as video
+        restrictToPeerWiFi(params)
         params.serviceClass = .responsiveData
         let udp = NWConnection(host: host, port: udpPort, using: params)
         cursorNetworkLock.lock()
@@ -2614,6 +2770,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         tcp.noDelay = true
         let params = NWParameters(tls: nil, tcp: tcp)
         params.preferNoProxies = true
+        restrictToPeerWiFi(params)
         params.serviceClass = .responsiveData
         let conn = NWConnection(host: host, port: NWEndpoint.Port(rawValue: offer.port)!, using: params)
         let socket = ControlSocket(connection: conn, owner: queue,
@@ -2701,6 +2858,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
         // Runs even while capture is unavailable: input is what must wake it.
         remoteUserActivity.record(obj)
+        if RemoteUserActivityPolicy.isUserInput(obj) { reportLoginStreamActivity() }
         switch type {
         case "controlBarrier":
             guard let offer = controlOffer, obj["token"] as? String == offer.token,
@@ -2753,6 +2911,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 sendJSONFrame("{\"type\":\"pong\",\"t\":\(t),\"mt\":\(mt)}")
             }
         case "stats":
+            if (obj["fps"] as? Int ?? 0) > 0 { reportLoginStreamActivity() }
             let feedback = AdaptiveVideoBitrate.Feedback(
                 receivedAt: ProcessInfo.processInfo.systemUptime,
                 mbps: obj["mbps"] as? Double ?? 0, rttMs: obj["rtt"] as? Double ?? 0,
@@ -2912,6 +3071,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             Log.info("phone requested keyframe")
             needsKeyframe = true
         case WireMessage.sleeping:
+            revokeLoginLease()
             // The device locked and is about to close on us. Hand the
             // session to the controller right away: it tears the virtual
             // display down (returning the cursor to a visible screen) and
@@ -2919,6 +3079,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             Log.info("receiver went to sleep — ending session, reconnect armed for wake")
             Task { @MainActor in self.onPeerSleeping?() }
         case WireMessage.closing:
+            revokeLoginLease()
             // The app on the device is quitting for real — end the session
             // without the silence grace and without waiting for a wake.
             Log.info("receiver app closed — ending session")

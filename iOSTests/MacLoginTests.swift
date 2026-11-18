@@ -144,6 +144,11 @@ final class MacLoginTests: XCTestCase {
         XCTAssertEqual(session.generation, generation)
         XCTAssertTrue(session.webView === view)
 
+        session.appWillResignActive()
+        XCTAssertTrue(session.authenticated)
+        XCTAssertEqual(session.generation, generation)
+        XCTAssertTrue(session.webView === view)
+
         // Video can be paused independently of the retained encrypted session.
         XCTAssertTrue(session.inputOnly)
         session.setInputOnly(false)
@@ -156,7 +161,7 @@ final class MacLoginTests: XCTestCase {
         session.resumeLogin()
         XCTAssertTrue(session.visible)
         XCTAssertTrue(session.makeWebView() === view)
-        session.cancel() // Same cleanup used when the app leaves the foreground.
+        session.appWillResignActive() // A visible login still closes on focus loss.
         XCTAssertFalse(session.started)
         XCTAssertFalse(session.authenticated)
         XCTAssertNil(session.webView)

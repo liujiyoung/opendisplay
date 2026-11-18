@@ -17,6 +17,13 @@ signature. Existing Screen Sharing account authentication and full ARD
 encryption remain required. The authenticated login socket is retained during
 the foreground handoff, as it is for the existing LAN login path.
 
+When the cable is removed during active desktop streaming, the relay keeps
+the existing Mac-side socket open while the sender moves the stream to Wi-Fi.
+It gives the same sender session up to 30 seconds to report activity from the
+same iPad. Fresh render reports or deliberate input renew the local hold.
+Locking the Mac, ending the stream, or losing those reports releases the
+socket. The relay continues to forward login data exclusively over USB.
+
 ## Build and install
 
 With exactly one trusted iPad connected by USB:
@@ -56,8 +63,9 @@ resumes through the existing sender's post-login LaunchAgent.
 ## Validation and limits
 
 `test_relay.py` exercises fragmented RFB greetings, simultaneous multi-megabyte
-data in both directions, peer closure, unavailable Screen Sharing, and invalid
-configuration. Test destinations are fixed to loopback. Production config
+data in both directions, peer closure, unavailable Screen Sharing, invalid
+configuration, and renewal, expiry and ownership of the retained socket.
+Test destinations are fixed to loopback. Production config
 cannot change the Mac target port or choose an arbitrary destination.
 
 iPad tests cover USB mode without a host, loopback-only peers, fragmented relay

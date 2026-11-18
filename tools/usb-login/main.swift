@@ -21,6 +21,8 @@ final class USBLoginRelay: @unchecked Sendable {
     private let testDevicePort: UInt16?
     private let serverPort: UInt16
     private let once: Bool
+    private let leaseStore: LoginStreamLease.Store?
+    private let handoffGrace: TimeInterval
     private var polling = false
     private var established = false
     private var generation = UUID()
@@ -30,13 +32,17 @@ final class USBLoginRelay: @unchecked Sendable {
     private var lastState = ""
     private var upBytes = 0
     private var downBytes = 0
+    private var retainedLogin: (lease: LoginStreamLease, started: Date, detached: Bool, renewed: Bool)?
 
     init(deviceUDID: String, testDevicePort: UInt16? = nil,
-         serverPort: UInt16 = 5900, once: Bool = false) {
+         serverPort: UInt16 = 5900, once: Bool = false,
+         leaseStore: LoginStreamLease.Store? = nil, handoffGrace: TimeInterval = 30) {
         self.deviceUDID = deviceUDID
         self.testDevicePort = testDevicePort
         self.serverPort = serverPort
         self.once = once
+        self.leaseStore = leaseStore
+        self.handoffGrace = handoffGrace
     }
 
     func start() {
@@ -55,6 +61,10 @@ final class USBLoginRelay: @unchecked Sendable {
     }
 
     private func poll() {
+        if retainedLogin != nil {
+            checkRetainedLogin()
+            return
+        }
         guard !polling, device == nil else { return }
         polling = true
         established = false
@@ -153,11 +163,91 @@ final class USBLoginRelay: @unchecked Sendable {
                 if upstream { self.upBytes += data.count } else { self.downBytes += data.count }
                 destination.send(content: data, completion: .contentProcessed { [weak self] writeError in
                     guard let self, self.generation == token else { return }
-                    if writeError != nil || error != nil || complete { self.close("login connection ended") }
-                    else { self.pump(from: source, to: destination, token: token, upstream: upstream) }
+                    if writeError != nil {
+                        self.pipeEnded(deviceSide: !upstream)
+                    } else if error != nil || complete {
+                        self.pipeEnded(deviceSide: upstream)
+                    } else {
+                        self.pump(from: source, to: destination, token: token, upstream: upstream)
+                    }
                 })
-            } else if error != nil || complete { self.close("login connection ended") }
+            } else if error != nil || complete { self.pipeEnded(deviceSide: upstream) }
             else { self.pump(from: source, to: destination, token: token, upstream: upstream) }
+        }
+    }
+
+    private func pipeEnded(deviceSide: Bool) {
+        guard deviceSide, established, let server, server.state == .ready,
+              let lease = leaseStore?.read(udid: deviceUDID), lease.active, lease.isFresh else {
+            close("login connection ended")
+            return
+        }
+
+        // The local authenticated socket stays open. Invalidate both old
+        // pumps, stop sending/reading and never forward it to a new client.
+        let token = UUID()
+        generation = token
+        device?.stateUpdateHandler = nil
+        device?.cancel()
+        device = nil
+        retainedLogin = (lease, Date(), testDevicePort != nil, false)
+        server.stateUpdateHandler = { [weak self] status in
+            guard let self, self.generation == token else { return }
+            switch status {
+            case .failed, .waiting, .cancelled: self.close("retained Screen Sharing socket ended")
+            default: break
+            }
+        }
+        if testDevicePort != nil {
+            state("retaining local Screen Sharing socket after USB detach")
+        } else {
+            // usbmuxd may deliver the socket EOF just before it removes the
+            // attached device. Bound the check so an ordinary client close
+            // or an unavailable usbmuxd cannot keep a login alive.
+            queue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self, self.generation == token,
+                      self.retainedLogin?.detached == false else { return }
+                self.close("USB detach not confirmed")
+            }
+            confirmUSBDetach(token: token)
+        }
+    }
+
+    private func confirmUSBDetach(token: UUID) {
+        Task { [deviceUDID, queue, weak self] in
+            let devices = try? await Usbmux.listDevices(queue: queue)
+            queue.async { [weak self] in
+                guard let self, self.generation == token else { return }
+                guard let devices else { self.close("USB detach check unavailable"); return }
+                if devices.contains(where: { $0.udid == deviceUDID }) {
+                    self.queue.asyncAfter(deadline: .now() + 0.25) { [weak self] in
+                        guard let self, self.generation == token else { return }
+                        self.confirmUSBDetach(token: token)
+                    }
+                } else {
+                    self.retainedLogin?.detached = true
+                    self.state("retaining local Screen Sharing socket after USB detach")
+                }
+            }
+        }
+    }
+
+    private func checkRetainedLogin() {
+        guard var retained = retainedLogin,
+              let lease = leaseStore?.read(udid: deviceUDID),
+              lease.session == retained.lease.session, lease.active else {
+            close("stream ended — released retained Screen Sharing socket")
+            return
+        }
+        guard retained.detached else { return }
+        if lease.isFresh, lease.updatedAt > retained.started.timeIntervalSince1970 {
+            if !retained.renewed { state("same receiver resumed streaming — retaining Screen Sharing") }
+            retained.renewed = true
+            retainedLogin = retained
+            return
+        }
+        if retained.renewed || Date().timeIntervalSince(retained.started) >= handoffGrace {
+            close("stream continuity expired — released retained Screen Sharing socket")
         }
     }
 
@@ -165,6 +255,7 @@ final class USBLoginRelay: @unchecked Sendable {
         let hadPipe = established
         generation = UUID()
         polling = false
+        retainedLogin = nil
         device?.stateUpdateHandler = nil
         server?.stateUpdateHandler = nil
         device?.cancel()
@@ -178,13 +269,15 @@ final class USBLoginRelay: @unchecked Sendable {
 
 let arguments = CommandLine.arguments
 let relay: USBLoginRelay
-if arguments.count == 5, arguments[1] == "--test-loopback",
+if (arguments.count == 5 || arguments.count == 6), arguments[1] == "--test-loopback",
    let devicePort = UInt16(arguments[2]), let serverPort = UInt16(arguments[3]),
    arguments[4] == "--once", devicePort > 1024, serverPort > 1024 {
     // Explicit foreground-only harness: destinations remain loopback. Production
     // config cannot change the Screen Sharing target or USB port.
-    relay = USBLoginRelay(deviceUDID: "test", testDevicePort: devicePort,
-                          serverPort: serverPort, once: true)
+    let testStore = arguments.count == 6
+        ? LoginStreamLease.Store(directory: URL(fileURLWithPath: arguments[5], isDirectory: true)) : nil
+    relay = USBLoginRelay(deviceUDID: "face", testDevicePort: devicePort,
+                          serverPort: serverPort, once: true, leaseStore: testStore, handoffGrace: 4)
 } else if arguments.count == 3, arguments[1] == "--config" {
     do {
         let data = try Data(contentsOf: URL(fileURLWithPath: arguments[2]))
@@ -193,7 +286,7 @@ if arguments.count == 5, arguments[1] == "--test-loopback",
               config.deviceUDID.allSatisfy({ $0.isHexDigit || $0 == "-" }) else {
             throw NSError(domain: "USBLoginConfiguration", code: 1)
         }
-        relay = USBLoginRelay(deviceUDID: config.deviceUDID)
+        relay = USBLoginRelay(deviceUDID: config.deviceUDID, leaseStore: LoginStreamLease.Store.local)
     } catch {
         Log.info("invalid USB login configuration; no listener or relay started")
         exit(2)

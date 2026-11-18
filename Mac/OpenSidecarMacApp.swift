@@ -95,6 +95,20 @@ enum MainWindow {
 enum ConnectionTarget: Hashable {
     case usb(udid: String?)           // wired via built-in usbmuxd; nil = first device
     case wifi(NWBrowser.Result)       // discovered via Bonjour
+    case peerWiFi(NWBrowser.Result, NWInterface)
+
+    var service: NWBrowser.Result? {
+        switch self {
+        case .usb: return nil
+        case .wifi(let result), .peerWiFi(let result, _): return result
+        }
+    }
+
+    var peerRoute: (NWEndpoint, NWInterface)? {
+        guard case .peerWiFi(let result, let interface) = self,
+              case .service(let name, let type, let domain, _) = result.endpoint else { return nil }
+        return (.service(name: name, type: type, domain: domain, interface: interface), interface)
+    }
 
     /// Stable identity for sessions and persistence — survives Bonjour
     /// re-discovery (fresh NWBrowser.Result) and USB replugs (new DeviceID).
@@ -104,8 +118,17 @@ enum ConnectionTarget: Hashable {
         case .wifi(let result):
             if case .service(let name, _, _, _) = result.endpoint { return "wifi:\(name)" }
             return "wifi:unknown"
+        case .peerWiFi(let result, _):
+            return "peer:\(ConnectionTarget.wifi(result).sessionID)"
         }
     }
+}
+
+enum ConnectionChoice: String, CaseIterable {
+    case automatic = "Auto"
+    case usb = "USB"
+    case wifi = "Wi-Fi"
+    case sidecar = "随航"
 }
 
 /// One connected (or connecting) device: its target, its sender pipeline,
@@ -138,6 +161,7 @@ final class DeviceSession: ObservableObject, Identifiable {
     // transport can migrate (cable-in upgrade, unplug failover) — these
     // track where the sender actually is right now.
     @Published var onUSB: Bool
+    @Published var onPeerWiFi = false
     // The udid the session is (or was last) cabled through, so a usbmuxd
     // detach can be matched back to this session for failover.
     var usbUDID: String?
@@ -152,7 +176,11 @@ final class DeviceSession: ObservableObject, Identifiable {
     // rather than WiFi — reported by the sender once connected.
     @Published var wired = false
 
-    var transportLabel: String { onUSB ? "USB" : wired ? "Cable" : "WiFi" }
+    var transportLabel: String {
+        if onUSB { return "USB" }
+        if onPeerWiFi { return "Wi-Fi 直连" }
+        return wired ? "Cable" : "Wi-Fi"
+    }
 
     // The Display size control (extend only): the choice for this device
     // and what each choice gives on it, from the latest hello.
@@ -191,6 +219,7 @@ final class DeviceSession: ObservableObject, Identifiable {
         } else {
             onUSB = false
         }
+        onPeerWiFi = target.peerRoute != nil
     }
 }
 
@@ -239,9 +268,23 @@ final class SenderController: ObservableObject {
         }
     }
 
-    var running: Bool { !sessions.isEmpty }
+    @Published private(set) var connectionChoice: ConnectionChoice = .automatic
+    @Published private(set) var peerWiFiTargets: [ConnectionTarget] = []
+    @Published private(set) var peerWiFiStatus = ""
+    @Published private(set) var sidecarDevices: [SystemSidecar.Device] = []
+    @Published private(set) var sidecarDevice: SystemSidecar.Device?
+    @Published private(set) var sidecarStatus = ""
+    @Published private(set) var switchingConnection = false
+    private lazy var sidecar = SystemSidecar()
+    private var sidecarStandby: VirtualDisplay?
+    private var sidecarMonitor: Task<Void, Never>?
+    private var suspendedTargets: [ConnectionTarget] = []
+
+    var running: Bool { !sessions.isEmpty || sidecarDevice != nil }
 
     private var browser: NWBrowser?
+    private var peerWiFiBrowser: NWBrowser?
+    private var policyTimer: Timer?
     private var usbWatcher: UsbmuxDeviceWatcher?
     private var accessoryWatcher: AccessoryDeviceWatcher?
 
@@ -266,6 +309,9 @@ final class SenderController: ObservableObject {
     }
     private var wifiRemembered = Set(UserDefaults.standard.stringArray(forKey: "wifiRemembered") ?? []) {
         didSet { UserDefaults.standard.set(Array(wifiRemembered), forKey: "wifiRemembered") }
+    }
+    private var rememberedPeerIDs = Set(UserDefaults.standard.stringArray(forKey: "rememberedPeerIDs") ?? []) {
+        didSet { UserDefaults.standard.set(Array(rememberedPeerIDs), forKey: "rememberedPeerIDs") }
     }
     // Install id learned from each USB device's hello, persisted, so the
     // same hardware is recognized across transports even when the user
@@ -312,6 +358,7 @@ final class SenderController: ObservableObject {
 
     init() {
         startBrowsing()
+        updatePeerWiFiBrowsing()
         usbWatcher = UsbmuxDeviceWatcher { [weak self] devices in
             self?.usbmuxDevices = devices
             self?.wiredDevicesChanged()
@@ -324,6 +371,14 @@ final class SenderController: ObservableObject {
             try? await Task.sleep(for: .seconds(2))
             self.wifiAutoConnectArmed = true
             self.autoConnect()
+        }
+        if autoConnectEnabled {
+            policyTimer = Timer.scheduledTimer(withTimeInterval: 5, repeats: true) { [weak self] _ in
+                Task { @MainActor in
+                    self?.updatePeerWiFiBrowsing()
+                    self?.autoConnect()
+                }
+            }
         }
     }
 
@@ -343,6 +398,62 @@ final class SenderController: ObservableObject {
         self.browser = browser
     }
 
+    private func updatePeerWiFiBrowsing() {
+        guard connectionChoice != .sidecar, autoConnectEnabled || connectionChoice == .wifi else {
+            peerWiFiBrowser?.cancel()
+            peerWiFiBrowser = nil
+            peerWiFiTargets = []
+            return
+        }
+        guard peerWiFiBrowser == nil else { return }
+        let params = NWParameters.tcp
+        params.includePeerToPeer = true
+        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_opensidecar._tcp", domain: nil),
+                                using: params)
+        peerWiFiStatus = ""
+        peerWiFiBrowser = browser
+        browser.browseResultsChangedHandler = { [weak self, weak browser] results, _ in
+            DispatchQueue.main.async {
+                guard let self, let browser, self.peerWiFiBrowser === browser else { return }
+                // includePeerToPeer also discovers LAN services. Offer only
+                // advertisements received on the Apple peer-to-peer link.
+                var targets: [String: ConnectionTarget] = [:]
+                for result in results {
+                    guard let interface = result.interfaces.first(where: { $0.name == "awdl0" }),
+                          self.serviceName(of: result) != nil else { continue }
+                    let target = ConnectionTarget.peerWiFi(result, interface)
+                    targets[target.sessionID] = target
+                }
+                self.peerWiFiTargets = targets.values.sorted { $0.sessionID < $1.sessionID }
+                self.autoConnect()
+            }
+        }
+        browser.stateUpdateHandler = { [weak self, weak browser] state in
+            DispatchQueue.main.async {
+                guard let self, let browser, self.peerWiFiBrowser === browser else { return }
+                switch state {
+                case .ready: self.peerWiFiStatus = ""
+                case .waiting(let error):
+                    self.peerWiFiStatus = "直连发现失败：\(error.localizedDescription)"
+                case .failed(let error):
+                    self.peerWiFiStatus = "直连发现失败：\(error.localizedDescription)"
+                    self.peerWiFiBrowser = nil
+                    self.peerWiFiTargets = []
+                    browser.cancel()
+                default: break
+                }
+            }
+        }
+        browser.start(queue: .main)
+    }
+
+    func refreshPeerWiFi() {
+        peerWiFiBrowser?.cancel()
+        peerWiFiBrowser = nil
+        peerWiFiTargets = []
+        updatePeerWiFiBrowsing()
+    }
+
     // MARK: - Physical-device identity
 
     private func serviceName(of result: NWBrowser.Result) -> String? {
@@ -355,11 +466,36 @@ final class SenderController: ObservableObject {
         return nil
     }
 
+    private func sameReceiver(_ first: NWBrowser.Result, _ second: NWBrowser.Result) -> Bool {
+        if let id = txtID(of: first), let otherID = txtID(of: second) { return id == otherID }
+        guard let name = serviceName(of: first) else { return false }
+        return name == serviceName(of: second)
+    }
+
+    private func installID(of session: DeviceSession) -> String? {
+        session.deviceID ?? session.target.service.flatMap(txtID)
+            ?? session.usbUDID.flatMap { installIDByUDID[$0] }
+    }
+
+    /// Bonjour can deliver the LAN record without TXT during a handoff.
+    /// Keep matching the active pipeline by its known service name or by the
+    /// same receiver's AWDL advertisement until the LAN record has its id.
+    private func matches(_ result: NWBrowser.Result, session: DeviceSession) -> Bool {
+        let peerID = installID(of: session)
+        if let id = txtID(of: result), let peerID { return id == peerID }
+        guard let name = serviceName(of: result) else { return false }
+        if name == session.wifiServiceName || name == session.name
+            || name == session.target.service.flatMap(serviceName) { return true }
+        if let peerID, let peerService = peerTarget(for: peerID)?.service,
+           name == serviceName(of: peerService) { return true }
+        return session.usbUDID.flatMap { udid in usbDevices.first { $0.udid == udid }?.name } == name
+    }
+
     /// Same hardware? Strong match: the service's install id equals the id
     /// this USB device announced in a (past or present) hello. Fallback for
     /// old receivers: lockdown device name equals the service name.
     private func sameDevice(_ result: NWBrowser.Result, _ device: UsbmuxDevice) -> Bool {
-        if let id = txtID(of: result), installIDByUDID[device.udid] == id { return true }
+        if let id = txtID(of: result), let otherID = installIDByUDID[device.udid] { return otherID == id }
         if let name = serviceName(of: result), let usbName = device.name,
            usbName == name { return true }
         return false
@@ -371,37 +507,148 @@ final class SenderController: ObservableObject {
     private func activeSession(coveringUSB device: UsbmuxDevice) -> DeviceSession? {
         if let direct = session(for: "usb:\(device.udid)"), !direct.failed { return direct }
         return sessions.first { s in
-            guard !s.failed, case .wifi(let result) = s.target else { return false }
-            if let id = installIDByUDID[device.udid],
-               s.deviceID == id || txtID(of: result) == id { return true }
-            return serviceName(of: result) != nil && device.name == serviceName(of: result)
+            guard !s.failed else { return false }
+            if s.usbUDID == device.udid { return true }
+            if let id = installIDByUDID[device.udid], let peerID = installID(of: s) { return peerID == id }
+            guard let result = s.target.service else { return false }
+            return sameDevice(result, device)
         }
     }
 
     /// The session (over either transport) already serving this WiFi service.
     /// Failed sessions are excluded for the same reason as above.
     private func activeSession(coveringWiFi result: NWBrowser.Result) -> DeviceSession? {
-        if let name = serviceName(of: result), let direct = session(for: "wifi:\(name)"),
-           !direct.failed {
-            return direct
-        }
-        return sessions.first { s in
-            guard !s.failed, case .usb(let udid) = s.target else { return false }
-            if let id = txtID(of: result), s.deviceID == id { return true }
-            if let udid, let device = usbDevices.first(where: { $0.udid == udid }),
-               sameDevice(result, device) { return true }
-            // Browse results routinely lack their TXT record and the USB
-            // device is gone after a failover — the service name is then
-            // the only remaining link to the session.
-            let name = serviceName(of: result)
-            return name != nil && (name == s.wifiServiceName || name == s.name)
-        }
+        sessions.first { !$0.failed && matches(result, session: $0) }
     }
 
     // MARK: - Connection policy
 
+    func selectConnection(_ choice: ConnectionChoice) async {
+        guard choice != connectionChoice, !switchingConnection else { return }
+        if choice == .sidecar {
+            connectionChoice = choice
+            sessions.forEach { $0.sender.pausePeerWiFiProbing() }
+            updatePeerWiFiBrowsing()
+            refreshSidecarDevices()
+            return
+        }
+        if let device = sidecarDevice, let sidecar {
+            switchingConnection = true
+            defer { switchingConnection = false }
+            do {
+                try await sidecar.setConnected(false, device: device)
+            } catch {
+                sidecarStatus = error.localizedDescription
+                Log.info("Sidecar disconnect failed: \(error)")
+                return
+            }
+        }
+        resumeOpenDisplay(choice)
+    }
+
+    func refreshSidecarDevices() {
+        guard !switchingConnection, sidecarDevice == nil else { return }
+        sidecarDevices = sidecar?.devices() ?? []
+        if sidecar == nil {
+            sidecarStatus = SystemSidecar.Failure.unavailable.localizedDescription
+        } else if sidecarDevices.isEmpty {
+            sidecarStatus = "No Sidecar iPads found. Unlock the iPad and try again."
+        } else {
+            sidecarStatus = ""
+        }
+    }
+
+    func connectSidecar(_ device: SystemSidecar.Device) async {
+        guard connectionChoice == .sidecar, !switchingConnection,
+              sidecarDevice == nil, let sidecar else { return }
+        switchingConnection = true
+        sidecarStatus = "Connecting…"
+        let previousTargets = sessions.filter { !$0.failed }.map(currentTarget)
+        defer { switchingConnection = false }
+        let alreadyConnected = sidecar.isConnected(device)
+        let beforeConnect = SidecarDisplayArrangement.onlineDisplays()
+        let openDisplays = sessions.compactMap { $0.sender.displayForSidecarHandoff }
+            .filter { beforeConnect.contains($0.displayID) }
+        let openDisplayIDs = Set(openDisplays.map(\.displayID))
+        let otherDisplays = beforeConnect.subtracting(openDisplayIDs)
+        // Retain a monitor WindowServer already accepted. Do not create
+        // another virtual display just to replace this one after connecting.
+        let standby = otherDisplays.count <= (alreadyConnected ? 1 : 0) ? openDisplays.first : nil
+        do {
+            Log.info("Requesting system Sidecar; retaining display id=\(standby?.displayID.description ?? "none")")
+            try await sidecar.setConnected(true, device: device)
+            if let standby {
+                standby.suspendOriginTrackingForSidecar()
+                try await SidecarDisplayArrangement.makeSidecarPrimary(
+                    excluding: alreadyConnected ? openDisplayIDs : beforeConnect)
+            }
+            guard sidecar.isConnected(device) else { throw SystemSidecar.Failure.deviceGone }
+            sidecarStandby = standby
+            sidecarDevice = device
+            sidecarStatus = "Connected via Sidecar"
+            Log.info("System Sidecar connected")
+            suspendedTargets = previousTargets
+            // Only retire the old displays once macOS reports Sidecar active.
+            // Keep the normal auto-connect records for the return trip.
+            sessions.forEach { end($0) }
+            updatePeerWiFiBrowsing()
+            observeSidecar(device)
+        } catch {
+            standby?.restoreOriginAfterFailedSidecarHandoff()
+            if !alreadyConnected, sidecar.isConnected(device) {
+                try? await sidecar.setConnected(false, device: device)
+            }
+            sidecarStatus = error.localizedDescription
+            Log.info("Sidecar connect failed: \(error)")
+        }
+    }
+
+    var currentOpenDisplayConnectionLabel: String? {
+        let transports = Set(sessions.filter { !$0.failed }.map(\.transportLabel)).sorted()
+        return transports.isEmpty ? nil : transports.joined(separator: " · ")
+    }
+
+    private func observeSidecar(_ device: SystemSidecar.Device) {
+        sidecarMonitor?.cancel()
+        sidecarMonitor = Task { [weak self] in
+            while !Task.isCancelled {
+                do { try await Task.sleep(for: .seconds(2)) } catch { return }
+                guard let self, self.sidecarDevice == device, let sidecar = self.sidecar else { return }
+                if !self.switchingConnection, !sidecar.isConnected(device) {
+                    Log.info("System Sidecar ended — waiting for a manual selection")
+                    self.sidecarDevice = nil
+                    self.sidecarStatus = "Sidecar disconnected."
+                    self.refreshSidecarDevices()
+                    return
+                }
+            }
+        }
+    }
+
+    private func resumeOpenDisplay(_ choice: ConnectionChoice) {
+        let targets = suspendedTargets
+        sidecarMonitor?.cancel()
+        sidecarMonitor = nil
+        sidecarDevice = nil
+        sidecarStandby = nil
+        suspendedTargets.removeAll()
+        sidecarStatus = ""
+        connectionChoice = choice
+        updatePeerWiFiBrowsing()
+        autoConnect()
+        for target in targets where isAvailable(target) { connect(to: target) }
+    }
+
+    func connectionTarget(for entry: DeviceEntry) -> ConnectionTarget? {
+        switch connectionChoice {
+        case .usb: return entry.usbTarget
+        case .wifi: return entry.wifiTarget
+        case .automatic, .sidecar: return entry.preferredTarget
+        }
+    }
+
     private func autoConnect() {
-        guard autoConnectEnabled else { return }
+        guard autoConnectEnabled, connectionChoice != .sidecar else { return }
         dedupeSessions()
         // The -host/-port escape hatch is an explicit choice — dial it like
         // the wired devices (it joins them, not replaces them).
@@ -421,7 +668,17 @@ final class SenderController: ObservableObject {
                 connect(to: .usb(udid: device.udid))
             }
         }
-        guard wifiAutoConnectArmed, autoReconnectWiFi || Date() < wifiAutoConnectDeadline else { return }
+        for session in sessions where !session.failed {
+            // Refresh the LAN route independently so an AWDL failure can use
+            // it immediately, even if the devices changed Wi-Fi networks.
+            session.sender.updateLANFallback(wifiService(for: session)?.endpoint)
+            if !session.onUSB, !session.onPeerWiFi, !session.wired,
+               let id = session.deviceID, let (endpoint, interface) = peerTarget(for: id)?.peerRoute {
+                session.sender.preferPeerWiFi(endpoint, interface: interface, installID: id)
+            }
+        }
+        guard wifiAutoConnectArmed,
+              autoReconnectWiFi || Date() < wifiAutoConnectDeadline else { return }
         for result in discovered {
             let target = ConnectionTarget.wifi(result)
             if wifiRemembered.contains(target.sessionID),
@@ -429,6 +686,31 @@ final class SenderController: ObservableObject {
                !cabled(result) {
                 connect(to: target)
             }
+        }
+        for target in peerWiFiTargets {
+            guard let result = target.service, let id = txtID(of: result),
+                  rememberedPeerIDs.contains(id), activeSession(coveringWiFi: result) == nil,
+                  !cabled(result) else { continue }
+            connect(to: target)
+        }
+    }
+
+    private func peerTarget(for installID: String) -> ConnectionTarget? {
+        peerWiFiTargets.first { $0.service.flatMap(txtID) == installID }
+    }
+
+    private func currentTarget(_ session: DeviceSession) -> ConnectionTarget {
+        if session.onUSB { return .usb(udid: session.usbUDID) }
+        if session.onPeerWiFi, let id = session.deviceID, let target = peerTarget(for: id) { return target }
+        if let result = wifiService(for: session) { return .wifi(result) }
+        return session.target
+    }
+
+    private func isAvailable(_ target: ConnectionTarget) -> Bool {
+        switch target {
+        case .usb(let udid): return udid == nil || usbDevices.contains { $0.udid == udid }
+        case .wifi: return discovered.contains { ConnectionTarget.wifi($0).sessionID == target.sessionID }
+        case .peerWiFi: return peerWiFiTargets.contains { $0.sessionID == target.sessionID }
         }
     }
 
@@ -460,7 +742,7 @@ final class SenderController: ObservableObject {
         let plugged = nowOnCable.subtracting(onDirectCable)
         onDirectCable = nowOnCable
         everOnCable.formUnion(nowOnCable)
-        guard autoConnectEnabled, !plugged.isEmpty else { return }
+        guard autoConnectEnabled, connectionChoice != .sidecar, !plugged.isEmpty else { return }
         for result in discovered {
             guard let name = serviceName(of: result), plugged.contains(name),
                   !cableOptOut.contains(name),
@@ -511,6 +793,7 @@ final class SenderController: ObservableObject {
         guard !session.onUSB, let portNum = UInt16(port) else { return }
         Log.info("cable attached for \(session.id) — migrating to USB")
         session.onUSB = true
+        session.onPeerWiFi = false
         session.usbUDID = device.udid
         // The match may have been by name only — pin the strong identity so
         // future matching (and the next launch) recognizes the pair.
@@ -522,14 +805,25 @@ final class SenderController: ObservableObject {
     /// service if one is visible. Without one the session keeps its normal
     /// fate — retry over USB through the grace period, then end.
     private func failover(detachedUDIDs: Set<String>) {
-        guard autoConnectEnabled, !detachedUDIDs.isEmpty else { return }
+        guard autoConnectEnabled, connectionChoice != .sidecar,
+              !detachedUDIDs.isEmpty else { return }
         for session in sessions where session.onUSB {
-            guard let udid = session.usbUDID, detachedUDIDs.contains(udid),
-                  let result = wifiService(for: session) else { continue }
+            guard let udid = session.usbUDID, detachedUDIDs.contains(udid) else { continue }
+            let lan = wifiService(for: session)
+            if let id = installID(of: session), let target = peerTarget(for: id),
+               let (endpoint, interface) = target.peerRoute {
+                session.onUSB = false
+                session.onPeerWiFi = true
+                session.wifiServiceName = target.service.flatMap(serviceName)
+                session.sender.updateLANFallback(lan?.endpoint)
+                session.sender.switchTransport(to: .tcp(endpoint, peerInterface: interface))
+                continue
+            }
+            guard let lan else { continue }
             Log.info("cable detached for \(session.id) — failing over to WiFi")
             session.onUSB = false
-            session.wifiServiceName = serviceName(of: result)
-            session.sender.switchTransport(to: .tcp(result.endpoint))
+            session.wifiServiceName = serviceName(of: lan)
+            session.sender.switchTransport(to: .tcp(lan.endpoint))
         }
     }
 
@@ -542,11 +836,12 @@ final class SenderController: ObservableObject {
     /// withdrawal that persists counts. One-shot, guarded re-check, so
     /// overlapping browse events at worst repeat an idempotent call.
     private func endSessionsWhoseServiceVanished() {
-        for session in sessions where !session.onUSB {
+        for session in sessions where !session.onUSB && !session.onPeerWiFi {
             guard wifiService(for: session) == nil else { continue }
             DispatchQueue.main.asyncAfter(deadline: .now() + 3) { [weak self, weak session] in
                 guard let self, let session,
                       self.sessions.contains(where: { $0 === session }),
+                      !session.onUSB, !session.onPeerWiFi,
                       self.wifiService(for: session) == nil else { return }
                 session.sender.peerServiceWithdrawn()
             }
@@ -555,39 +850,26 @@ final class SenderController: ObservableObject {
 
     /// The discovered WiFi service belonging to this session's device.
     private func wifiService(for session: DeviceSession) -> NWBrowser.Result? {
-        discovered.first { result in
-            if let id = txtID(of: result), let deviceID = session.deviceID {
-                return id == deviceID
-            }
-            let name = serviceName(of: result)
-            return name != nil && (name == session.wifiServiceName || name == session.name)
-        }
+        discovered.first { matches($0, session: session) }
     }
 
     /// Safety net, not a feature: if identity was learned too late (old
     /// receiver, renamed service) and one physical device ended up with two
-    /// sessions, the transports steal the receiver's single connection from
-    /// each other forever. Keep the cable, drop the WiFi twin.
+    /// sessions, preserve the established pipeline and record the service
+    /// alias before retiring the twin, so discovery cannot dial it again.
     private func dedupeSessions() {
-        // Failed sessions hold no pipeline: a USB corpse must never win the
-        // "keep the cable" rule against a working WiFi session.
-        let usbSessionIDs = Set(sessions.compactMap { s -> String? in
-            if case .usb = s.target, !s.failed { return s.deviceID }
-            return nil
-        })
-        let cabledNames = Set(usbDevices.compactMap { device -> String? in
-            guard let s = session(for: "usb:\(device.udid)"), !s.failed else { return nil }
-            return device.name
-        })
-        for s in sessions {
-            guard case .wifi(let result) = s.target else { continue }
-            let duplicate = (s.deviceID.map { usbSessionIDs.contains($0) } ?? false)
-                || (txtID(of: result).map { usbSessionIDs.contains($0) } ?? false)
-                || (serviceName(of: result).map { cabledNames.contains($0) } ?? false)
-            if duplicate {
-                Log.info("two sessions for one device — keeping the cable, dropping \(s.id)")
-                end(s)
+        var owners: [String: DeviceSession] = [:]
+        for session in sessions where !session.failed {
+            guard let id = installID(of: session) else { continue }
+            guard let owner = owners[id] else {
+                owners[id] = session
+                continue
             }
+            if let name = session.target.service.flatMap(serviceName) {
+                owner.wifiServiceName = name
+            }
+            Log.info("two sessions for one device — keeping \(owner.id), dropping \(session.id)")
+            end(session)
         }
     }
 
@@ -601,7 +883,7 @@ final class SenderController: ObservableObject {
             }
             if udid == nil { return "Manual (\(host):\(port))" }
             return udid.flatMap(AOA.serial(fromUDID:)) == nil ? "iPhone / iPad" : "Android device"
-        case .wifi(let result):
+        case .wifi(let result), .peerWiFi(let result, _):
             return serviceName(of: result) ?? "WiFi device"
         }
     }
@@ -630,6 +912,7 @@ final class SenderController: ObservableObject {
 
     func connect(to target: ConnectionTarget, userInitiated: Bool = false,
                  awaitingWake: Bool = false) {
+        guard connectionChoice != .sidecar else { return }
         let id = target.sessionID
         if let existing = session(for: id) {
             // A failed session holds no pipeline — replace the corpse
@@ -648,13 +931,17 @@ final class SenderController: ObservableObject {
         case .usb(let udid?):
             covering = usbDevices.first(where: { $0.udid == udid })
                 .flatMap { activeSession(coveringUSB: $0) }
-        case .wifi(let result):
+        case .wifi(let result), .peerWiFi(let result, _):
             covering = activeSession(coveringWiFi: result)
         default:
             covering = nil
         }
         if let covering {
             guard userInitiated else { return }
+            if autoConnectEnabled {
+                autoConnect()
+                return
+            }
             Log.info("user chose \(id) — taking over from \(covering.id)")
             end(covering)
         }
@@ -667,6 +954,9 @@ final class SenderController: ObservableObject {
         case .wifi(let result):
             wifiRemembered.insert(id)
             if userInitiated, let name = serviceName(of: result) { cableOptOut.remove(name) }
+        case .peerWiFi(let result, _):
+            // Allow LAN recovery for a device first connected over AWDL.
+            wifiRemembered.insert(ConnectionTarget.wifi(result).sessionID)
         }
 
         let transport: SenderTransport
@@ -682,17 +972,24 @@ final class SenderController: ObservableObject {
             }
         case .wifi(let result):
             transport = .tcp(result.endpoint)
+        case .peerWiFi:
+            guard let (endpoint, interface) = target.peerRoute else { return }
+            transport = .tcp(endpoint, peerInterface: interface)
         }
 
         let name = label(for: target)
+        let lanFallback = target.service.flatMap { result in
+            discovered.first { sameReceiver(result, $0) }?.endpoint
+        }
         let sender = MacSender(transport: transport, name: name, mode: mode,
                                quality: quality, adaptiveBitrateEnabled: adaptiveBitrateEnabled,
                                capsLockSwitchesInputSource: capsLockSwitchesInputSource,
+                               lanFallback: lanFallback,
                                displaySerial: Self.displaySerial(for: id),
                                identityOffset: identityOffset(for: id),
                                awaitingWake: awaitingWake)
         let session = DeviceSession(id: id, target: target, name: name, sender: sender)
-        if case .wifi(let result) = target {
+        if let result = target.service {
             session.wifiServiceName = serviceName(of: result)
         }
         sender.onStatus = { [weak session] text in
@@ -703,9 +1000,14 @@ final class SenderController: ObservableObject {
             Log.info("status[\(id)]: \(text)")
         }
         sender.onHello = { [weak self, weak session] info in
-            guard let self, let session else { return }
-            session.deviceID = info.id
+            guard let self, let session, self.session(for: id) === session else { return }
+            if let id = info.id { session.deviceID = id }
             session.deviceKind = info.device
+            if let installID = info.id,
+               info.device == "iPad" || info.device == "iPhone",
+               !self.rememberedPeerIDs.contains(installID) {
+                self.rememberedPeerIDs.insert(installID)
+            }
             session.helloArrived(info)
             let power = (info.power ?? []).compactMap(PowerAction.init(rawValue:))
             if power != session.powerActions {
@@ -713,10 +1015,9 @@ final class SenderController: ObservableObject {
                     + (power.isEmpty ? "none" : power.map(\.rawValue).joined(separator: ",")))
                 session.powerActions = power
             }
-            if case .usb(let udid?) = session.target, let installID = info.id {
+            if session.onUSB, let udid = session.usbUDID, let installID = info.id {
                 self.installIDByUDID[udid] = installID
             }
-            self.dedupeSessions()
             // The learned identity may reveal that this WiFi session's device
             // is cabled — take the upgrade opportunity right away.
             self.autoConnect()
@@ -738,8 +1039,8 @@ final class SenderController: ObservableObject {
             // the session (which frees the cursor from the now-invisible
             // display) is paired with a replacement session that dials
             // patiently until the device wakes and accepts again.
-            guard let self, let session else { return }
-            let target = session.target
+            guard let self, let session, self.session(for: id) === session else { return }
+            let target = self.currentTarget(session)
             Log.info("session \(session.id) asleep — display down, waiting for wake")
             self.end(session)
             self.connect(to: target, awaitingWake: true)
@@ -748,7 +1049,7 @@ final class SenderController: ObservableObject {
             // The user stopped the capture in the system UI — same intent as
             // the in-app Disconnect, so it also opts the device out of
             // auto-connect (or the next browse event would resurrect it).
-            guard let self, let session else { return }
+            guard let self, let session, self.session(for: id) === session else { return }
             Log.info("session \(session.id) capture stopped via the system UI — honoring as disconnect")
             self.disconnect(session)
         }
@@ -761,14 +1062,15 @@ final class SenderController: ObservableObject {
             Log.info("display identity for \(session.id) moved to offset \(totalOffset) — "
                 + "macOS saved hostile state for the old one")
         }
-        sender.onTransportPath = { [weak session] wired in
+        sender.onTransportPath = { [weak session] wired, peerWiFi in
             session?.wired = wired
+            session?.onPeerWiFi = peerWiFi
         }
         sender.onPeerClosed = { [weak self, weak session] in
             // The receiver app quit — a deliberate goodbye, so no reconnect
             // waits around. Reopening the app is a fresh start handled by
             // the normal discovery/auto-connect paths.
-            guard let self, let session else { return }
+            guard let self, let session, self.session(for: id) === session else { return }
             Log.info("session \(session.id) closed by the receiver — ending")
             if session.onUSB, let udid = session.usbUDID, AOA.serial(fromUDID: udid) != nil {
                 self.receiverClosedOnCable.insert(udid)
@@ -802,15 +1104,26 @@ final class SenderController: ObservableObject {
             if let name = session.wifiServiceName, everOnCable.contains(name) {
                 cableOptOut.insert(name)
             }
+        case .peerWiFi: break
         }
         // A migrated session is also reachable the other way — opt that side
         // out too, or auto-connect resurrects the device moments later.
-        if session.onUSB, let udid = session.usbUDID { usbDisabled.insert("usb:\(udid)") }
+        if let udid = session.usbUDID { usbDisabled.insert("usb:\(udid)") }
         if let name = session.wifiServiceName { wifiRemembered.remove("wifi:\(name)") }
+        if let id = session.deviceID ?? session.target.service.flatMap(txtID) {
+            rememberedPeerIDs.remove(id)
+            for result in discovered where txtID(of: result) == id {
+                wifiRemembered.remove(ConnectionTarget.wifi(result).sessionID)
+            }
+        }
         end(session)
     }
 
     func disconnectAll() {
+        if sidecarDevice != nil {
+            Task { await selectConnection(.automatic) }
+            return
+        }
         sessions.forEach { disconnect($0) }
     }
 
@@ -818,20 +1131,20 @@ final class SenderController: ObservableObject {
     /// freed): tear the corpse out and dial the same target fresh. The
     /// socket-only Reconnect can't help there — nothing was ever built.
     func retry(_ session: DeviceSession) {
-        let target = session.target
+        let target = currentTarget(session)
         end(session)
         connect(to: target, userInitiated: true)
     }
 
     private func end(_ session: DeviceSession) {
         session.sender.stop()
-        sessions.removeAll { $0.id == session.id }
+        sessions.removeAll { $0 === session }
     }
 
     /// Mode/quality apply per-pipeline at construction — rebuild every session.
     func restartAll() {
-        guard running else { return }
-        let targets = sessions.map(\.target)
+        guard !sessions.isEmpty else { return }
+        let targets = sessions.map(currentTarget)
         sessions.forEach { $0.sender.stop() }
         sessions.removeAll()
         targets.forEach { connect(to: $0) }
@@ -847,30 +1160,38 @@ final class SenderController: ObservableObject {
         let wifiTarget: ConnectionTarget?
 
         var transportLabel: String {
-            switch (usbTarget != nil, wifiTarget != nil) {
-            case (true, true): return "USB · WiFi"
-            case (true, false): return "USB"
-            case (false, true): return "WiFi"
-            default: return ""
-            }
+            let wireless = wifiTarget?.peerRoute == nil ? "Wi-Fi" : "Wi-Fi 直连"
+            if usbTarget != nil { return wifiTarget == nil ? "USB" : "USB · \(wireless)" }
+            return wifiTarget == nil ? "" : wireless
         }
         /// Lowest latency first.
         var preferredTarget: ConnectionTarget? { usbTarget ?? wifiTarget }
     }
 
     var deviceEntries: [DeviceEntry] {
+        // AWDL and LAN can advertise the same app. Keep one row with AWDL as
+        // its preferred wireless target and LAN available for fallback.
+        var wirelessTargets: [ConnectionTarget] = []
+        for target in peerWiFiTargets + discovered.map(ConnectionTarget.wifi) {
+            guard let result = target.service, !wirelessTargets.contains(where: { existing in
+                existing.service.map { sameReceiver($0, result) } ?? false
+            }) else { continue }
+            wirelessTargets.append(target)
+        }
         var entries: [DeviceEntry] = []
-        var mergedServices = Set<String>()
+        var mergedWireless = Set<ConnectionTarget>()
         var coveredSessionIDs = Set<String>()
 
         for device in usbDevices {
-            // A discovered WiFi service for the same hardware folds into
-            // this row instead of appearing as a second device.
-            let twin = discovered.first { sameDevice($0, device) }
-            if let twin, let name = serviceName(of: twin) { mergedServices.insert(name) }
+            let twin = wirelessTargets.first { target in
+                target.service.map { sameDevice($0, device) } ?? false
+            }
             let usbTarget = ConnectionTarget.usb(udid: device.udid)
             coveredSessionIDs.insert(usbTarget.sessionID)
-            if let twin { coveredSessionIDs.insert(ConnectionTarget.wifi(twin).sessionID) }
+            if let twin {
+                mergedWireless.insert(twin)
+                coveredSessionIDs.insert(twin.sessionID)
+            }
             // A WiFi-identity session migrated onto this cable serves the
             // device even when its service is no longer advertised.
             if let covering = activeSession(coveringUSB: device) {
@@ -879,11 +1200,11 @@ final class SenderController: ObservableObject {
             entries.append(DeviceEntry(
                 id: "device:\(device.udid)",
                 name: device.name
-                    ?? twin.flatMap(serviceName)
+                    ?? twin?.service.flatMap(serviceName)
                     ?? session(for: usbTarget.sessionID)?.deviceKind
                     ?? label(for: usbTarget),
                 usbTarget: usbTarget,
-                wifiTarget: twin.map { .wifi($0) }))
+                wifiTarget: twin))
         }
         if UserDefaults.standard.object(forKey: "host") != nil {
             let target = ConnectionTarget.usb(udid: nil)
@@ -891,18 +1212,19 @@ final class SenderController: ObservableObject {
             entries.append(DeviceEntry(id: target.sessionID, name: label(for: target),
                                        usbTarget: target, wifiTarget: nil))
         }
-        for result in discovered {
-            guard let name = serviceName(of: result), !mergedServices.contains(name)
-            else { continue }
-            let target = ConnectionTarget.wifi(result)
-            coveredSessionIDs.insert(target.sessionID)
+        for target in wirelessTargets where !mergedWireless.contains(target) {
+            guard let result = target.service, let name = serviceName(of: result) else { continue }
             // A USB-identity session that failed over to WiFi serves this
             // service — claim it, or it would dangle as a second row and
             // this one would offer a Connect that steals the receiver.
             if let covering = activeSession(coveringWiFi: result) {
-                coveredSessionIDs.insert(covering.id)
+                guard coveredSessionIDs.insert(covering.id).inserted else {
+                    coveredSessionIDs.insert(target.sessionID)
+                    continue
+                }
             }
-            entries.append(DeviceEntry(id: "service:\(name)", name: name,
+            coveredSessionIDs.insert(target.sessionID)
+            entries.append(DeviceEntry(id: "service:\(txtID(of: result) ?? name)", name: name,
                                        usbTarget: nil, wifiTarget: target))
         }
         // Sessions whose device vanished from discovery (e.g. Bonjour record
@@ -912,6 +1234,12 @@ final class SenderController: ObservableObject {
                                        usbTarget: nil, wifiTarget: nil))
         }
         return entries
+    }
+
+    var visibleDeviceEntries: [DeviceEntry] {
+        let entries = deviceEntries
+        guard connectionChoice == .wifi else { return entries }
+        return entries.filter { $0.wifiTarget != nil || session(for: $0)?.onUSB == false }
     }
 
     func session(for entry: DeviceEntry) -> DeviceSession? {
@@ -925,7 +1253,7 @@ final class SenderController: ObservableObject {
             if let s = session(for: target.sessionID) { return s }
             // Transport-migrated sessions keep their original identity — a
             // USB-identity session failed over to WiFi still owns this row.
-            if case .wifi(let result) = target,
+            if let result = target.service,
                let s = activeSession(coveringWiFi: result) { return s }
         }
         return session(for: entry.id)   // dangling-session rows
@@ -995,8 +1323,11 @@ struct ContentView: View {
                 }
                 Spacer()
                 if controller.running {
-                    Button("Disconnect All") { controller.disconnectAll() }
+                    Button(controller.sidecarDevice == nil ? "Disconnect All" : "Disconnect Sidecar") {
+                        controller.disconnectAll()
+                    }
                         .controlSize(.large)
+                    .disabled(controller.switchingConnection)
                 }
             }
             .padding(16)
@@ -1005,77 +1336,143 @@ struct ContentView: View {
 
             // Settings
             Form {
-                Section("Devices") {
-                    if controller.deviceEntries.isEmpty {
-                        Text("No devices found — plug one in via USB, or open the OpenDisplay app on a device on this WiFi network.")
-                            .font(.caption)
-                            .foregroundStyle(.secondary)
+                Picker("Connection", selection: Binding(
+                    get: { controller.connectionChoice },
+                    set: { choice in Task { await controller.selectConnection(choice) } }
+                )) {
+                    ForEach(ConnectionChoice.allCases, id: \.self) { choice in
+                        Text(choice.rawValue).tag(choice)
                     }
-                    ForEach(controller.deviceEntries) { entry in
-                        if let session = controller.session(for: entry) {
-                            // Title from the entry, not the session: the
-                            // session name was snapshotted at connect time,
-                            // often before lockdown resolved the real name.
-                            SessionRow(title: entry.name, session: session,
-                                       controller: controller)
+                }
+                .pickerStyle(.segmented)
+                .accessibilityIdentifier("connectionChoice")
+                .disabled(controller.switchingConnection)
+
+                if controller.connectionChoice != .sidecar {
+                    Text("Auto：USB → Wi-Fi 直连 → Wi-Fi")
+                        .font(.caption)
+                        .foregroundStyle(.secondary)
+                }
+
+                if controller.connectionChoice != .sidecar, !controller.sidecarStatus.isEmpty {
+                    Text(controller.sidecarStatus).font(.caption).foregroundStyle(.secondary)
+                }
+
+                if controller.connectionChoice == .sidecar {
+                    Section("随航 · Apple Sidecar") {
+                        if let device = controller.sidecarDevice {
+                            Label(device.name, systemImage: "ipad.landscape")
                         } else {
-                            HStack(alignment: .firstTextBaseline) {
-                                Circle()
-                                    .fill(.secondary.opacity(0.5))
-                                    .frame(width: 9, height: 9)
-                                VStack(alignment: .leading, spacing: 2) {
-                                    Text(entry.name)
-                                    Text(entry.transportLabel)
-                                        .font(.caption)
-                                        .foregroundStyle(.secondary)
+                            if let transport = controller.currentOpenDisplayConnectionLabel {
+                                Text("Current OpenDisplay connection: \(transport)")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                            ForEach(controller.sidecarDevices) { device in
+                                HStack {
+                                    Label(device.name, systemImage: "ipad.landscape")
+                                    Spacer()
+                                    Button("Connect") { Task { await controller.connectSidecar(device) } }
+                                        .controlSize(.small)
                                 }
-                                Spacer()
-                                if let target = entry.preferredTarget {
-                                    Button("Connect") {
-                                        controller.connect(to: target, userInitiated: true)
-                                    }
+                            }
+                            Button("Refresh iPads") { controller.refreshSidecarDevices() }
+                                .controlSize(.small)
+                            Text("For wireless Sidecar, unplug USB first. If the Mac locks, unlock via Mac 登录 → 局域网.")
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                        if !controller.sidecarStatus.isEmpty {
+                            Text(controller.sidecarStatus)
+                                .font(.caption)
+                                .foregroundStyle(.secondary)
+                        }
+                    }
+                    .disabled(controller.switchingConnection)
+                } else {
+                    Section(controller.connectionChoice == .wifi ? "Wi-Fi 设备" : "Devices") {
+                        let entries = controller.visibleDeviceEntries
+                        if entries.isEmpty {
+                            if controller.connectionChoice == .wifi {
+                                Text(controller.peerWiFiStatus.isEmpty
+                                     ? "请在 iPad 上打开 OpenDisplay。可使用同一局域网，或在 Settings & Help 中开启 Wi-Fi 直连。"
+                                     : controller.peerWiFiStatus)
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                                Button("重新搜索") { controller.refreshPeerWiFi() }
                                     .controlSize(.small)
+                            } else {
+                                Text("No devices found — plug one in via USB, or open the OpenDisplay app on a device on this WiFi network.")
+                                    .font(.caption)
+                                    .foregroundStyle(.secondary)
+                            }
+                        }
+                        ForEach(entries) { entry in
+                            if let session = controller.session(for: entry) {
+                                // Title from the entry, not the session: the
+                                // session name was snapshotted at connect time,
+                                // often before lockdown resolved the real name.
+                                SessionRow(title: entry.name, session: session,
+                                           controller: controller)
+                            } else {
+                                HStack(alignment: .firstTextBaseline) {
+                                    Circle()
+                                        .fill(.secondary.opacity(0.5))
+                                        .frame(width: 9, height: 9)
+                                    VStack(alignment: .leading, spacing: 2) {
+                                        Text(entry.name)
+                                        Text(entry.transportLabel)
+                                            .font(.caption)
+                                            .foregroundStyle(.secondary)
+                                    }
+                                    Spacer()
+                                    if let target = controller.connectionTarget(for: entry) {
+                                        Button("Connect") {
+                                            controller.connect(to: target, userInitiated: true)
+                                        }
+                                        .controlSize(.small)
+                                    }
                                 }
                             }
                         }
                     }
-                }
 
-                Picker("Mode", selection: $controller.mode) {
-                    Text("Extend").tag(CaptureMode.extend)
-                    Text("Mirror").tag(CaptureMode.mirror)
-                }
-                .pickerStyle(.segmented)
-                .onChange(of: controller.mode) { controller.restartAll() }
-
-                VStack(alignment: .leading, spacing: 4) {
-                    Picker("Quality", selection: $controller.quality) {
-                        ForEach(StreamQuality.allCases, id: \.self) { q in
-                            Text(q.label).tag(q)
-                        }
+                    Picker("Mode", selection: $controller.mode) {
+                        Text("Extend").tag(CaptureMode.extend)
+                        Text("Mirror").tag(CaptureMode.mirror)
                     }
-                    .onChange(of: controller.quality) { controller.restartAll() }
-                    Text(controller.quality.explanation)
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                    .pickerStyle(.segmented)
+                    .onChange(of: controller.mode) { controller.restartAll() }
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Adaptive bitrate (Wi-Fi)", isOn: $controller.adaptiveBitrateEnabled)
-                        .toggleStyle(.switch)
-                        .accessibilityIdentifier("adaptiveBitrateToggle")
-                    Text("Automatically adjusts video quality on Wi-Fi. USB always uses a fixed bitrate.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
-                }
+                    VStack(alignment: .leading, spacing: 4) {
+                        Picker("Quality", selection: $controller.quality) {
+                            ForEach(StreamQuality.allCases, id: \.self) { q in
+                                Text(q.label).tag(q)
+                            }
+                        }
+                        .onChange(of: controller.quality) { controller.restartAll() }
+                        Text(controller.quality.explanation)
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
 
-                VStack(alignment: .leading, spacing: 4) {
-                    Toggle("Caps Lock switches input source", isOn: $controller.capsLockSwitchesInputSource)
-                        .toggleStyle(.switch)
-                        .accessibilityIdentifier("capsLockInputSourceToggle")
-                    Text("Off: Caps Lock controls letter case. On: switch between input sources.")
-                        .font(.caption)
-                        .foregroundStyle(.secondary)
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle("Adaptive bitrate (Wi-Fi)", isOn: $controller.adaptiveBitrateEnabled)
+                            .toggleStyle(.switch)
+                            .accessibilityIdentifier("adaptiveBitrateToggle")
+                        Text("Automatically adjusts video quality on Wi-Fi. USB always uses a fixed bitrate.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
+
+                    VStack(alignment: .leading, spacing: 4) {
+                        Toggle("Caps Lock switches input source", isOn: $controller.capsLockSwitchesInputSource)
+                            .toggleStyle(.switch)
+                            .accessibilityIdentifier("capsLockInputSourceToggle")
+                        Text("Off: Caps Lock controls letter case. On: switch between input sources.")
+                            .font(.caption)
+                            .foregroundStyle(.secondary)
+                    }
                 }
 
                 VStack(alignment: .leading, spacing: 4) {
@@ -1139,7 +1536,7 @@ struct ContentView: View {
                 Circle()
                     .fill(controller.running ? .green : .secondary.opacity(0.5))
                     .frame(width: 9, height: 9)
-                Text(controller.running
+                Text(controller.sidecarDevice != nil ? "Sidecar connected" : controller.running
                      ? "\(controller.sessions.count) device\(controller.sessions.count == 1 ? "" : "s") connected"
                      : "Idle")
                     .font(.callout)
