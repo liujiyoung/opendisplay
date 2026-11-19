@@ -15,6 +15,7 @@ struct PhoneInfo: Decodable {
                           // 6.3); absent = cursor stays on TCP
     let controlPort: Int?
     let controlToken: String? // optional independent TCP, scoped to this session
+    let streamHandoff: Bool? // keeps the last picture during a prepared socket migration
     let addrs: [String]?  // every address the receiver is reachable on
                           // (PROTOCOL.md 6.4); probed for a cable upgrade
     let maxEncodeWide: Int?  // receiver's decode ceiling in pixels (PROTOCOL.md

@@ -35,7 +35,29 @@ enum WireMessage {
     static let sleeping = "sleeping"                // phone -> Mac: device locked, reconnect on wake
     static let closing = "closing"                  // phone -> Mac: app quit, end the session for good
     static let streamConfig = "streamConfig"        // Mac -> receiver: selected video operating point
+    static let streamHandoff = "streamHandoff"      // Mac -> receiver: first message on a prepared video path
     static let power = "power"                      // Mac -> receiver: shut down (PROTOCOL.md 6.6)
+}
+
+/// A handoff marker precedes codec setup and video on the replacement socket.
+/// A receiver uses the sender's previously announced ID to recognize the
+/// same display pipeline. Ordinary reconnects need no marker.
+enum StreamHandoff {
+    static func leadingControlFrameSize(in bytes: Data) -> Int? {
+        guard bytes.count >= 5, bytes[bytes.startIndex + 4] == UInt8(ascii: "{") else { return nil }
+        let length = bytes.withUnsafeBytes { Int(UInt32(bigEndian: $0.loadUnaligned(as: UInt32.self))) }
+        guard (1...512).contains(length) else { return nil }
+        return length + 4
+    }
+
+    static func senderSession(in bytes: Data) -> UUID? {
+        guard let size = leadingControlFrameSize(in: bytes), bytes.count >= size,
+              let object = try? JSONSerialization.jsonObject(with: Data(bytes.prefix(size).dropFirst(4))) as? [String: Any],
+              object["type"] as? String == WireMessage.streamHandoff,
+              object["screenLocked"] as? Bool == false,
+              let id = object["senderSession"] as? String else { return nil }
+        return UUID(uuidString: id)
+    }
 }
 
 /// What a `power` message asks the receiver to do (PROTOCOL.md 6.6). The

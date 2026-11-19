@@ -197,6 +197,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     }
 
     private var lastHello: PhoneInfo?
+    private let streamSessionID = UUID()
     private var helloContinuation: CheckedContinuation<PhoneInfo, Error>?
     private var inputInjector: InputInjector?
     private let remoteUserActivity = RemoteUserActivity()
@@ -1528,7 +1529,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         }
     }
 
-    private func retireTransport() {
+    private func retireTransport(keepPreviousVideo: Bool = false) {
         inputInjector?.releaseRemoteInput()
         remoteUserActivity.reset()
         connectionReady = false
@@ -1536,7 +1537,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         dialGeneration += 1
         connection?.stateUpdateHandler = nil
         connection?.viabilityUpdateHandler = nil
-        connection?.cancel()
+        if !keepPreviousVideo { connection?.cancel() }
         connection = nil
         closeCursorChannel()
         closeControlChannel()
@@ -1611,7 +1612,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
                 self.peerWiFiProbe = nil
                 self.transport = .tcp(endpoint, peerInterface: interface)
                 Log.info("upgrading active stream to Wi-Fi direct via \(interface.name)")
-                self.migrate(to: probe)
+                self.migrate(to: probe, preservePicture: hello.streamHandoff == true)
             }
         }
     }
@@ -2111,14 +2112,28 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Swap the live session onto the probed connection. Same shape as a
     /// reconnect: the receiver parks the newcomer, adopts it on our first
     /// bytes, and the abandoned WiFi socket's EOF is ignored as stale.
-    private func migrate(to conn: NWConnection) {
+    private func migrate(to conn: NWConnection, preservePicture: Bool = false) {
         let names = conn.currentPath?.availableInterfaces.map(\.name)
             .joined(separator: ",") ?? "?"
         Log.info("preferred path answered (\(names)) — migrating the session")
         upgradeProbes.removeAll { $0 === conn }
         cancelPeerWiFiProbe()
-        retireTransport()
+        let previousVideo = preservePicture && consoleIsInteractive ? connection : nil
+        // A control socket's EOF also ends the receiver's video session.
+        // Keep both previous sockets alive until the receiver can adopt the
+        // marked newcomer while it still has a live picture to retain.
+        let previousControl = previousVideo == nil ? nil : controlSocket
+        if previousVideo != nil { controlSocket = nil }
+        retireTransport(keepPreviousVideo: previousVideo != nil)
         connection = conn
+        if let previousVideo {
+            sendJSONFrame("{\"type\":\"\(WireMessage.streamHandoff)\",\"senderSession\":\"\(streamSessionID)\",\"screenLocked\":false}",
+                          on: conn)
+            queue.asyncAfter(deadline: .now() + 1.5) {
+                previousControl?.cancel()
+                previousVideo.cancel()
+            }
+        }
         conn.stateUpdateHandler = { [weak self] state in
             guard let self, self.connection === conn else { return }
             switch state {
@@ -2136,6 +2151,12 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
             }
         }
         becomeReady(conn)
+        if previousVideo != nil, let pixelBuffer = lastPixelBuffer {
+            // Send an IDR even when the desktop is static. The ordinary
+            // reconnect watchdog can otherwise wait longer than the hold.
+            encode(pixelBuffer, pts: CMClockGetTime(CMClockGetHostTimeClock()),
+                   generation: captureGenerationNow)
+        }
     }
 
     /// Local zones a link-local probe could ride: interfaces that are up,
@@ -3765,7 +3786,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Identify ourselves to the receiver: our protocol version and the oldest
     /// receiver version we still support.
     private func sendWelcome() {
-        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"remoteInput\":\(RemoteInput.relativePointerCapability),\"capsLockKey\":\(RemoteInput.capsLockKeyCapability),\"latencyProbes\":1,\"screenLocked\":\(screenLockedForPeer())}")
+        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"remoteInput\":\(RemoteInput.relativePointerCapability),\"capsLockKey\":\(RemoteInput.capsLockKeyCapability),\"latencyProbes\":1,\"senderSession\":\"\(streamSessionID)\",\"screenLocked\":\(screenLockedForPeer())}")
     }
 
     /// Announce the operating point before video. Legacy receivers ignore the

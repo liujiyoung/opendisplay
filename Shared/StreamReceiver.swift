@@ -75,6 +75,8 @@ final class StreamReceiver: ObservableObject {
     private var videoGeneration: UInt64 = 0
     private var announcedVideoFrame = false
     private var remoteScreenLocked = false
+    private var senderSessionID: UUID?
+    private var handoffGeneration: UInt64?
     @Published var perf = PerfStats()
     // Compatibility signal from the connected Mac (issue #132). Nil = no signal.
     // Merged into the update gate by ReceiverScreen.
@@ -459,7 +461,9 @@ final class StreamReceiver: ObservableObject {
             self.renderingPaused = paused
             self.resetLatencySamples()
             Log.info(paused ? "rendering paused (backgrounded)" : "rendering resumed")
-            if !paused {
+            if paused {
+                self.discardHandoffPicture()
+            } else {
                 self.displayLayer.flush()
                 if self.connection?.state == .ready {
                     self.sendControl(["type": "kf"])
@@ -677,27 +681,7 @@ final class StreamReceiver: ObservableObject {
                     // arrive before adopt(), then be indistinguishable from
                     // the old session's flow that adopt must retire.
                     self.sendHello(on: conn, includeCursorPort: false)
-                    conn.receive(minimumIncompleteLength: 1, maximumLength: 1 << 18) {
-                        [weak self] data, _, isComplete, error in
-                        guard let self else { return }
-                        // Only a still-tracked candidate may adopt: adoption
-                        // of a rival and stop() both clear the list, so a
-                        // late callback can't evict a session or resurrect a
-                        // stopped receiver.
-                        guard self.pendingConnections.contains(where: { $0 === conn }) else {
-                            conn.cancel()
-                            return
-                        }
-                        self.pendingConnections.removeAll { $0 === conn }
-                        if let data, !data.isEmpty {
-                            self.adopt(conn, greeted: true, initialData: data)
-                        } else {
-                            Log.info("ignored a twin connection that closed at once"
-                                     + (error.map { " (\($0))" } ?? ""))
-                            conn.cancel()
-                        }
-                        _ = isComplete
-                    }
+                    self.receiveCandidate(conn)
                 }
                 conn.start(queue: self.queue)
             } else {
@@ -726,6 +710,43 @@ final class StreamReceiver: ObservableObject {
         listener.start(queue: queue)
         if cursorListener == nil { startCursorListener() }
         startControlListener()
+    }
+
+    /// A prepared sender's small first control frame can straddle two TCP
+    /// reads. Wait for this frame only; ordinary video still adopts eagerly.
+    private func receiveCandidate(_ conn: NWConnection) {
+        conn.receive(minimumIncompleteLength: 5, maximumLength: 1 << 18) { [weak self] data, _, complete, error in
+            guard let self, self.pendingConnections.contains(where: { $0 === conn }) else {
+                conn.cancel()
+                return
+            }
+            guard error == nil, !complete, let data, data.count >= 5 else {
+                self.pendingConnections.removeAll { $0 === conn }
+                conn.cancel()
+                return
+            }
+            if let length = StreamHandoff.leadingControlFrameSize(in: data), data.count < length {
+                let missing = length - data.count
+                conn.receive(minimumIncompleteLength: missing, maximumLength: missing) { [weak self] rest, _, complete, error in
+                    guard let self else { conn.cancel(); return }
+                    let initialData = error == nil && !complete && rest?.count == missing
+                        ? rest.map { data + $0 } : nil
+                    self.adoptCandidate(conn, initialData: initialData)
+                }
+            } else {
+                self.adoptCandidate(conn, initialData: data)
+            }
+        }
+    }
+
+    private func adoptCandidate(_ conn: NWConnection, initialData: Data?) {
+        guard pendingConnections.contains(where: { $0 === conn }), let initialData else {
+            pendingConnections.removeAll { $0 === conn }
+            conn.cancel()
+            return
+        }
+        pendingConnections.removeAll { $0 === conn }
+        adopt(conn, greeted: true, initialData: initialData)
     }
 
     // MARK: - Independent reliable control channel (Wi-Fi)
@@ -843,6 +864,8 @@ final class StreamReceiver: ObservableObject {
     /// opens a cursor flow that unambiguously belongs to this session.
     private func adopt(_ conn: NWConnection, greeted: Bool = false, initialData: Data? = nil) {
         if greeted { Log.info("newcomer proved itself — adopting it as the session") }
+        let retainsPicture = connection != nil && announcedVideoFrame && !remoteScreenLocked && !renderingPaused
+            && senderSessionID != nil && initialData.flatMap(StreamHandoff.senderSession(in:)) == senderSessionID
         connection?.cancel()
         connection = conn
         // The race is decided: rival candidates die here.
@@ -857,7 +880,7 @@ final class StreamReceiver: ObservableObject {
         cursorConnection = nil
         resetControlChannel()
         controlToken = UUID().uuidString
-        resetStreamState()
+        resetStreamState(retainingPicture: retainsPicture)
         cursorSequence.resetSession()
         cursorPortAnnounced = false
         // Hide the previous sender's cursor: replayed into a fresh video view
@@ -1062,6 +1085,7 @@ final class StreamReceiver: ObservableObject {
                 self.onCursorImage?(image, anchor, normSize)
             }
         case WireMessage.welcome:
+            senderSessionID = (obj["senderSession"] as? String).flatMap(UUID.init(uuidString:))
             updateScreenLocked(obj["screenLocked"] as? Bool)
             // The Mac identified itself (issue #132). If it speaks a protocol
             // older than we support, it's the Mac that needs updating — and an
@@ -1094,7 +1118,8 @@ final class StreamReceiver: ObservableObject {
                 sps = nil
                 pps = nil
                 formatDesc = nil
-                displayLayer.flushAndRemoveImage()
+                if handoffGeneration != nil { displayLayer.flush() }
+                else { displayLayer.flushAndRemoveImage() }
             }
             let width = obj["width"] as? Int ?? 0
             let height = obj["height"] as? Int ?? 0
@@ -1151,14 +1176,16 @@ final class StreamReceiver: ObservableObject {
         }
     }
 
-    private func resetStreamState() {
+    private func resetStreamState(retainingPicture: Bool) {
         videoGeneration &+= 1
         announcedVideoFrame = false
         remoteScreenLocked = false
+        senderSessionID = nil
         let generation = videoGeneration
+        handoffGeneration = retainingPicture ? generation : nil
         DispatchQueue.main.async {
-            self.videoPresentation.begin(generation)
-            self.videoSize = .zero
+            self.videoPresentation.begin(generation, retainingPicture: retainingPicture)
+            if !retainingPicture { self.videoSize = .zero }
         }
         resetLatencySamples()
         supportsLatencyProbes = false
@@ -1172,11 +1199,17 @@ final class StreamReceiver: ObservableObject {
         lastFrameAt = nil
         frameIntervals.removeAll()
         decodeFlushes = 0
-        // The normal AVSampleBufferDisplayLayer path must never inherit the
-        // previous session's last frame. The cursor is a separate channel, so
-        // retaining that image can otherwise look like a live desktop even
-        // when video setup failed.
-        displayLayer.flushAndRemoveImage()
+        if retainingPicture {
+            // Drop queued samples, but leave the displayed image behind the
+            // next IDR. UIKit keeps the same layer mounted during the hold.
+            displayLayer.flush()
+            queue.asyncAfter(deadline: .now() + 1.5) { [weak self] in
+                guard let self, self.handoffGeneration == generation else { return }
+                self.discardHandoffPicture()
+            }
+        } else {
+            displayLayer.flushAndRemoveImage()
+        }
         if let session = decompressionSession {
             VTDecompressionSessionInvalidate(session)
             decompressionSession = nil
@@ -1188,6 +1221,7 @@ final class StreamReceiver: ObservableObject {
     private func updateScreenLocked(_ value: Bool?) {
         guard let value, value != remoteScreenLocked else { return }
         remoteScreenLocked = value
+        if value { discardHandoffPicture() }
         announcedVideoFrame = false
         let generation = videoGeneration
         DispatchQueue.main.async {
@@ -1198,10 +1232,18 @@ final class StreamReceiver: ObservableObject {
     private func announceVideoFrame() {
         guard !announcedVideoFrame, !remoteScreenLocked else { return }
         announcedVideoFrame = true
+        handoffGeneration = nil
         let generation = videoGeneration
         DispatchQueue.main.async {
             self.videoPresentation.receivedFrame(generation)
         }
+    }
+
+    private func discardHandoffPicture() {
+        guard let generation = handoffGeneration else { return }
+        displayLayer.flushAndRemoveImage()
+        DispatchQueue.main.async { self.videoPresentation.endHold(generation) }
+        // Keep input gated until a fresh frame arrives from this connection.
     }
 
     // MARK: - Control messages (phone -> Mac)
@@ -1217,6 +1259,9 @@ final class StreamReceiver: ObservableObject {
             "pv": WireProtocol.version,   // issue #132 — absent on old receivers
             "displayMaxFrameRate": displayMaxFrameRate,
         ]
+        #if os(iOS)
+        hello["streamHandoff"] = true
+        #endif
         let panel = panelOverride ?? PanelAnnouncement(
             pixelsWide: devicePixelsWide, pixelsHigh: devicePixelsHigh, scale: deviceScale)
         hello["panel"] = panel.json
@@ -1431,6 +1476,13 @@ final class StreamReceiver: ObservableObject {
         queue.async {
             if let conn {
                 self.sendVideoControl(message, on: conn, completion: completion)
+                return
+            }
+            if self.handoffGeneration != nil,
+               let type = message["type"] as? String,
+               ["key", "text", "pointer", "pointerRelative", "pointerScroll", "touch",
+                "scroll", "pencil", "proximity"].contains(type) {
+                completion?()
                 return
             }
             guard let payload = try? JSONSerialization.data(withJSONObject: message) else { completion?(); return }
@@ -1748,8 +1800,8 @@ final class StreamReceiver: ObservableObject {
                 displayLayer.flush()
             }
             displayLayer.enqueue(sample)
+            announceVideoFrame()
         }
-        announceVideoFrame()
 
         // Per-frame timing for the performance overlay.
         let now = Date()
@@ -1901,6 +1953,7 @@ final class StreamReceiver: ObservableObject {
             if status == noErr, let imageBuffer {
                 self.decodeWindow.append(self.nowMs - t0)
                 self.onDecodedFrame?(imageBuffer, captureMs)
+                self.announceVideoFrame()
             } else {
                 if self.decodeErrorCount % 60 == 0 {
                     Log.info("decode output error: \(status) imageBuffer=\(imageBuffer != nil)")
@@ -1946,6 +1999,10 @@ final class StreamReceiver: ObservableObject {
 
     private func setConnected(_ value: Bool) {
         let generation = videoGeneration
+        if !value {
+            discardHandoffPicture()
+            handoffGeneration = nil
+        }
         DispatchQueue.main.async {
             guard self.videoPresentation.generation == generation else { return }
             self.connected = value

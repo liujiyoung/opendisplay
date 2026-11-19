@@ -90,6 +90,10 @@ struct ReceiverScreen: View {
             && model.receiver.videoPresentation.isReady
     }
 
+    private var showsDesktop: Bool {
+        isStreaming || model.receiver.videoPresentation.isHoldingPreviousFrame
+    }
+
     private var shouldCapturePointer: Bool {
         isStreaming && model.receiver.supportsRelativePointer
             && !showRemoteTools && !showSettings && !showSoftwareKeyboard && !showMacLogin
@@ -114,13 +118,13 @@ struct ReceiverScreen: View {
         // comes from WindowObserver below, not from the proxy.
         GeometryReader { _ in
             ZStack {
-                if isStreaming {
+                if showsDesktop {
                     Color.black.ignoresSafeArea()
                     VideoLayerView(displayLayer: model.receiver.displayLayer,
                                    receiver: model.receiver,
                                    useMetal: metalRenderer,
                                    softwareKeyboard: showSoftwareKeyboard,
-                                   inputEnabled: !showMacLogin && !showSettings,
+                                   inputEnabled: isStreaming && !showMacLogin && !showSettings,
                                    pointerCapture: pointerCapture,
                                    onToggleTools: {
                                        withAnimation(.easeInOut(duration: 0.15)) {
@@ -129,6 +133,7 @@ struct ReceiverScreen: View {
                                    })
                         .id(metalRenderer)   // rebuild the layer tree on toggle
                         .ignoresSafeArea()
+                        .allowsHitTesting(isStreaming)
                     if showRemoteTools {
                         VStack {
                             HStack {
@@ -180,7 +185,7 @@ struct ReceiverScreen: View {
                         }
                         .padding(.top, 44)
                         .padding(.horizontal, 12)
-                        .disabled(!model.receiver.supportsRemoteInput)
+                        .disabled(!isStreaming || !model.receiver.supportsRemoteInput)
                     }
                     if showAnalytics {
                         VStack {
@@ -213,9 +218,9 @@ struct ReceiverScreen: View {
                 OnboardingView { onboardingDismissed = true }
             }
         }
-        .ignoresSafeArea(.container, edges: isStreaming ? .all : [])
-        .statusBarHidden(isStreaming)
-        .systemOverlaysHidden(isStreaming)
+        .ignoresSafeArea(.container, edges: showsDesktop ? .all : [])
+        .statusBarHidden(showsDesktop)
+        .systemOverlaysHidden(showsDesktop)
         .sheet(isPresented: $showSettings) {
             SettingsView(receiver: model.receiver)
         }
