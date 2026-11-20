@@ -13,6 +13,7 @@
 // default names, cursor drawing, orientation) are injected by the app layer.
 
 import Foundation
+import Combine
 import Network
 import AVFoundation
 import CoreMedia
@@ -76,6 +77,11 @@ final class StreamReceiver: ObservableObject {
     private var announcedVideoFrame = false
     private var remoteScreenLocked = false
     private var senderSessionID: UUID?
+    private var activeSenderMac: UUID?
+    private var selectedMac: UUID?
+    private var usbMacOnly = false
+    @Published private(set) var connectedMacID: UUID?
+    var onMacIdentity: ((UUID, String, String) -> Void)?
     private var handoffGeneration: UInt64?
     @Published var perf = PerfStats()
     // Compatibility signal from the connected Mac (issue #132). Nil = no signal.
@@ -302,8 +308,42 @@ final class StreamReceiver: ObservableObject {
         var txt = NWTXTRecord()
         txt["id"] = Self.installID
         txt["pv"] = String(WireProtocol.version)   // issue #132
-        return NWListener.Service(name: serviceName, type: "_opensidecar._tcp",
+        if usbMacOnly { txt[MacTargetRouting.selectionKey] = MacTargetRouting.usbSelection }
+        else if let selectedMac { txt[MacTargetRouting.selectionKey] = selectedMac.uuidString }
+        return NWListener.Service(name: serviceName, type: MacTargetRouting.service,
                                   domain: nil, txtRecord: txt)
+    }
+
+    func selectMac(_ id: UUID?, usbOnly: Bool = false) {
+        queue.async {
+            guard self.selectedMac != id || self.usbMacOnly != usbOnly else { return }
+            self.selectedMac = id
+            self.usbMacOnly = usbOnly
+            // A candidate still parsing its first frame is reevaluated against
+            // the new selection before it is allowed to replace the session.
+            if let connection = self.connection,
+               !self.admitsMac(on: connection, sender: self.activeSenderMac) {
+                self.endVideoSession(connection)
+            }
+            self.listener?.service = self.advertisedService
+            if self.connection == nil { self.setStatus(self.waitingStatus) }
+        }
+    }
+
+    private func admitsMac(on connection: NWConnection, sender: UUID?) -> Bool {
+        (!usbMacOnly || Self.isUSB(connection))
+            && MacTargetRouting.admits(selected: selectedMac, sender: sender)
+    }
+
+    private static func isUSB(_ connection: NWConnection) -> Bool {
+        guard case let .hostPort(host, _) = connection.endpoint else { return false }
+        return host == NWEndpoint.Host("127.0.0.1") || host == NWEndpoint.Host("::1")
+            || host == NWEndpoint.Host("localhost")
+    }
+
+    private var waitingStatus: String {
+        if usbMacOnly { return "等待 USB 数据线所连的 Mac…" }
+        return selectedMac == nil ? "Ready to connect" : "正在等待所选的 Mac…"
     }
 
     /// Update the advertised name and re-publish if already listening.
@@ -501,6 +541,7 @@ final class StreamReceiver: ObservableObject {
                 finished = true
                 self.connection?.cancel()
                 self.connection = nil
+                self.activeSenderMac = nil
                 self.listener?.cancel()
                 self.listener = nil
                 self.listenerHealthy = false
@@ -658,6 +699,7 @@ final class StreamReceiver: ObservableObject {
         listener.service = advertisedService
         listener.newConnectionHandler = { [weak self, weak listener] conn in
             guard let self, let listener, self.listener === listener else { conn.cancel(); return }
+            guard !self.usbMacOnly || Self.isUSB(conn) else { conn.cancel(); return }
             Log.info("new connection from \(String(describing: conn.endpoint))")
             // usbmux-forwarded (cable) connections arrive from loopback;
             // anything else came over the network.
@@ -671,11 +713,19 @@ final class StreamReceiver: ObservableObject {
             // EOF, so the proof is bytes: greet the newcomer and adopt it
             // the moment it streams something back; a socket that closes
             // or errors first is discarded and the session stays put.
-            if let current = self.connection, current.state != .cancelled,
-               !Self.isFailed(current.state) {
+            let hasLiveSession = self.connection.map {
+                $0.state != .cancelled && !Self.isFailed($0.state)
+            } ?? false
+            if self.selectedMac != nil || hasLiveSession {
+                guard self.pendingConnections.count < 8 else { conn.cancel(); return }
                 self.pendingConnections.append(conn)
                 conn.stateUpdateHandler = { [weak self] state in
-                    guard let self, case .ready = state else { return }
+                    guard let self, self.pendingConnections.contains(where: { $0 === conn }) else { return }
+                    if Self.isFailed(state) || state == .cancelled {
+                        self.rejectCandidate(conn)
+                        return
+                    }
+                    guard case .ready = state else { return }
                     // This socket has not won the session yet. Keep cursor UDP
                     // out of its provisional hello: otherwise its flow could
                     // arrive before adopt(), then be indistinguishable from
@@ -684,6 +734,11 @@ final class StreamReceiver: ObservableObject {
                     self.receiveCandidate(conn)
                 }
                 conn.start(queue: self.queue)
+                self.queue.asyncAfter(deadline: .now() + 5) { [weak self, weak conn] in
+                    guard let self, let conn,
+                          self.pendingConnections.contains(where: { $0 === conn }) else { return }
+                    self.rejectCandidate(conn)
+                }
             } else {
                 self.adopt(conn)
             }
@@ -693,7 +748,7 @@ final class StreamReceiver: ObservableObject {
             switch state {
             case .ready:
                 self.listenerHealthy = true
-                if self.connection == nil { self.setStatus("Ready to connect") }
+                if self.connection == nil { self.setStatus(self.waitingStatus) }
             case .failed(let error):
                 Log.info("listener failed: \(error) — restarting in 1s")
                 self.listenerHealthy = false
@@ -712,8 +767,8 @@ final class StreamReceiver: ObservableObject {
         startControlListener()
     }
 
-    /// A prepared sender's small first control frame can straddle two TCP
-    /// reads. Wait for this frame only; ordinary video still adopts eagerly.
+    /// The sender's initial identity or handoff frame can straddle TCP reads.
+    /// Legacy video still adopts eagerly when the user has not selected a Mac.
     private func receiveCandidate(_ conn: NWConnection) {
         conn.receive(minimumIncompleteLength: 5, maximumLength: 1 << 18) { [weak self] data, _, complete, error in
             guard let self, self.pendingConnections.contains(where: { $0 === conn }) else {
@@ -721,8 +776,7 @@ final class StreamReceiver: ObservableObject {
                 return
             }
             guard error == nil, !complete, let data, data.count >= 5 else {
-                self.pendingConnections.removeAll { $0 === conn }
-                conn.cancel()
+                self.rejectCandidate(conn)
                 return
             }
             if let length = StreamHandoff.leadingControlFrameSize(in: data), data.count < length {
@@ -740,13 +794,20 @@ final class StreamReceiver: ObservableObject {
     }
 
     private func adoptCandidate(_ conn: NWConnection, initialData: Data?) {
-        guard pendingConnections.contains(where: { $0 === conn }), let initialData else {
-            pendingConnections.removeAll { $0 === conn }
-            conn.cancel()
+        guard pendingConnections.contains(where: { $0 === conn }) else { return }
+        guard let initialData,
+              admitsMac(on: conn, sender: MacTargetRouting.sender(in: initialData)) else {
+            rejectCandidate(conn)
             return
         }
         pendingConnections.removeAll { $0 === conn }
         adopt(conn, greeted: true, initialData: initialData)
+    }
+
+    private func rejectCandidate(_ conn: NWConnection) {
+        pendingConnections.removeAll { $0 === conn }
+        conn.stateUpdateHandler = nil
+        conn.cancel()
     }
 
     // MARK: - Independent reliable control channel (Wi-Fi)
@@ -881,6 +942,7 @@ final class StreamReceiver: ObservableObject {
         resetControlChannel()
         controlToken = UUID().uuidString
         resetStreamState(retainingPicture: retainsPicture)
+        activeSenderMac = initialData.flatMap(MacTargetRouting.sender(in:))
         cursorSequence.resetSession()
         cursorPortAnnounced = false
         // Hide the previous sender's cursor: replayed into a fresh video view
@@ -895,9 +957,7 @@ final class StreamReceiver: ObservableObject {
         let onReady: () -> Void = { [weak self] in
             guard let self else { return }
             self.lastDataReceived = Date()
-            let peer = String(describing: conn.endpoint)
-            self.transport = (peer.hasPrefix("127.0.0.1") || peer.hasPrefix("::1")
-                              || peer.hasPrefix("localhost")) ? "USB" : "WiFi"
+            self.transport = Self.isUSB(conn) ? "USB" : "WiFi"
             // Non-loopback is WiFi only if the path says so: a Mac receiver on
             // a Thunderbolt Bridge or USB-C peer link is a cable too.
             if self.transport != "USB", let path = conn.currentPath {
@@ -1084,8 +1144,24 @@ final class StreamReceiver: ObservableObject {
                 self.cursorSprite = (image, anchor, normSize)
                 self.onCursorImage?(image, anchor, normSize)
             }
+        case WireMessage.senderIdentity:
+            if let id = (obj["senderMac"] as? String).flatMap(UUID.init(uuidString:)) {
+                activeSenderMac = id
+            }
         case WireMessage.welcome:
             senderSessionID = (obj["senderSession"] as? String).flatMap(UUID.init(uuidString:))
+            if let id = (obj["senderMac"] as? String).flatMap(UUID.init(uuidString:)),
+               MacTargetRouting.admits(selected: selectedMac, sender: id) {
+                activeSenderMac = id
+                let name = obj["macName"] as? String ?? "Mac"
+                let host = obj["macHost"] as? String ?? ""
+                let generation = videoGeneration
+                DispatchQueue.main.async {
+                    guard self.videoPresentation.accepts(generation) else { return }
+                    self.connectedMacID = id
+                    self.onMacIdentity?(id, name, host)
+                }
+            }
             updateScreenLocked(obj["screenLocked"] as? Bool)
             // The Mac identified itself (issue #132). If it speaks a protocol
             // older than we support, it's the Mac that needs updating — and an
@@ -1181,10 +1257,12 @@ final class StreamReceiver: ObservableObject {
         announcedVideoFrame = false
         remoteScreenLocked = false
         senderSessionID = nil
+        activeSenderMac = nil
         let generation = videoGeneration
         handoffGeneration = retainingPicture ? generation : nil
         DispatchQueue.main.async {
             self.videoPresentation.begin(generation, retainingPicture: retainingPicture)
+            if !retainingPicture { self.connectedMacID = nil }
             if !retainingPicture { self.videoSize = .zero }
         }
         resetLatencySamples()
@@ -1517,7 +1595,11 @@ final class StreamReceiver: ObservableObject {
     private func endVideoSession(_ conn: NWConnection) {
         guard connection === conn else { return }
         connection = nil
+        activeSenderMac = nil
         resetControlChannel()
+        let cursor = cursorConnection
+        cursorConnection = nil
+        cursor?.cancel()
         conn.cancel()
         setConnected(false)
     }
@@ -2007,6 +2089,7 @@ final class StreamReceiver: ObservableObject {
             guard self.videoPresentation.generation == generation else { return }
             self.connected = value
             if !value {
+                self.connectedMacID = nil
                 self.videoPresentation.end(generation)
                 self.videoSize = .zero
                 self.macProtocolVersion = WireProtocol.assumedWhenAbsent
@@ -2016,7 +2099,7 @@ final class StreamReceiver: ObservableObject {
                 self.remoteModifiers = 0
             }
         }
-        if !value { setStatus("Ready to connect") }
+        if !value { setStatus(waitingStatus) }
         else {
             setStatus("Connected")
             // Remember the first ever successful connection to a Mac so the

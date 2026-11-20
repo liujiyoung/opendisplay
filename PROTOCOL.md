@@ -810,6 +810,25 @@ and reactivation, clears its local forwarded-key cache, and ignores late key-up
 events from an inactive scene. This prevents an iPadOS-owned Command-Tab from
 leaving a subsequent plain click interpreted as Command-click on the Mac.
 
+### 6.11 Selecting a Mac on iPad
+
+Updated Mac senders advertise `_opensidecar._tcp` with `role=macSender`, a
+persistent installation UUID (`id`), and their local Screen Sharing host name
+(`host`). Updated senders exclude these announcements from the receiver list.
+This is discovery metadata; the existing macOS Screen Sharing account
+authentication still applies. The discovery listener accepts no application
+data; clients use the advertised host name and port 5900 for login.
+
+An iPad advertising a selected Mac in the receiver service's optional
+`targetMac` TXT field asks only that installation to dial. The receiver
+also verifies the first framed message before replacing its current session:
+`senderIdentity` or `streamHandoff` must carry the selected `senderMac` UUID.
+Selection survives an address/transport change, including USB, Wi-Fi Direct,
+and LAN reconnects. It is a routing choice, not cryptographic authentication.
+The special TXT value `usb` suppresses wireless dials and the receiver accepts
+only loopback connections from the USB data cable in that mode. When the field
+is absent, legacy receivers and senders retain automatic behavior.
+
 ## 7. Coordinate spaces and units
 
 The most common third-party bug is a unit mismatch, so here is every space

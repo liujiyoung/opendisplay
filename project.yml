@@ -175,6 +175,9 @@ targets:
       - Mac/Log.swift
       - Mac/LogPolicies.swift
       - Shared/Protocol.swift
+      - Shared/StreamReceiver.swift
+      - Shared/IdleFrameDumper.swift
+      - Shared/AppStore.swift
       - Shared/RemoteInput.swift
       - Shared/ReceiverVideoPresentation.swift
       - Shared/DesktopPointer.swift
@@ -229,7 +232,7 @@ targets:
         UIRequiresFullScreen: true
         UIApplicationSupportsIndirectInputEvents: true
         UIRequiresFullScreenIgnoredStartingWithVersion: "27"
-        NSLocalNetworkUsageDescription: OpenDisplay advertises itself on the local network so your Mac can connect over WiFi.
+        NSLocalNetworkUsageDescription: OpenDisplay finds your Macs and receives their displays over the local network.
         NSBonjourServices: ["_opensidecar._tcp"]
         UISupportedInterfaceOrientations:
           - UIInterfaceOrientationPortrait

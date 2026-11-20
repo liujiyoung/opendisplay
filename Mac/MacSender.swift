@@ -1935,6 +1935,9 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         // this socket. VideoToolbox callbacks run independently of `queue`, so
         // setting connectionReady first would allow the reconnect IDR to win.
         helloSeenOnConnection = false
+        // A receiver pinned to a Mac must be able to check the first frame,
+        // before we send codec setup or video from an already-running capture.
+        sendJSONFrame("{\"type\":\"\(WireMessage.senderIdentity)\",\"senderMac\":\"\(LocalMacTarget.id)\"}", on: conn)
         if let selected = activeStreamConfigurationSnapshot, peerAcceptsActiveCodec {
             sendStreamConfiguration(selected, on: conn)
         }
@@ -2127,7 +2130,7 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
         retireTransport(keepPreviousVideo: previousVideo != nil)
         connection = conn
         if let previousVideo {
-            sendJSONFrame("{\"type\":\"\(WireMessage.streamHandoff)\",\"senderSession\":\"\(streamSessionID)\",\"screenLocked\":false}",
+            sendJSONFrame("{\"type\":\"\(WireMessage.streamHandoff)\",\"senderSession\":\"\(streamSessionID)\",\"senderMac\":\"\(LocalMacTarget.id)\",\"screenLocked\":false}",
                           on: conn)
             queue.asyncAfter(deadline: .now() + 1.5) {
                 previousControl?.cancel()
@@ -3786,7 +3789,14 @@ final class MacSender: NSObject, SCStreamOutput, SCStreamDelegate {
     /// Identify ourselves to the receiver: our protocol version and the oldest
     /// receiver version we still support.
     private func sendWelcome() {
-        sendJSONFrame("{\"type\":\"\(WireMessage.welcome)\",\"pv\":\(WireProtocol.version),\"min\":\(WireProtocol.minSupportedPeer),\"remoteInput\":\(RemoteInput.relativePointerCapability),\"capsLockKey\":\(RemoteInput.capsLockKeyCapability),\"latencyProbes\":1,\"senderSession\":\"\(streamSessionID)\",\"screenLocked\":\(screenLockedForPeer())}")
+        let message: [String: Any] = [
+            "type": WireMessage.welcome, "pv": WireProtocol.version, "min": WireProtocol.minSupportedPeer,
+            "remoteInput": RemoteInput.relativePointerCapability, "capsLockKey": RemoteInput.capsLockKeyCapability,
+            "latencyProbes": 1, "senderSession": streamSessionID.uuidString, "screenLocked": screenLockedForPeer(),
+            "senderMac": LocalMacTarget.id.uuidString, "macName": LocalMacTarget.name, "macHost": LocalMacTarget.host,
+        ]
+        if let data = try? JSONSerialization.data(withJSONObject: message),
+           let json = String(data: data, encoding: .utf8) { sendJSONFrame(json) }
     }
 
     /// Announce the operating point before video. Legacy receivers ignore the

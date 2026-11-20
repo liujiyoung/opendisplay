@@ -70,6 +70,7 @@ struct ReceiverScreen: View {
     @ObservedObject var pointerCapture: RelativePointerCapture
     @StateObject private var model = ReceiverModel()
     @StateObject private var macLoginSession = MacLoginSession()
+    @StateObject private var macTargetPicker = MacTargetPickerModel()
     @StateObject private var versionGate = VersionGate()
     @State private var showSettings = false
     @State private var showOnboarding = false
@@ -77,6 +78,7 @@ struct ReceiverScreen: View {
     @State private var showSoftwareKeyboard = false
     @State private var showRemoteTools = false
     @State private var showMacLogin = false
+    @State private var showMacPicker = false
     @AppStorage("showAnalytics") private var showAnalytics = false
     @AppStorage("metalRenderer") private var metalRenderer = false
     // First-run onboarding (issue #49): explain the Mac app is required.
@@ -88,6 +90,7 @@ struct ReceiverScreen: View {
     private var isStreaming: Bool {
         model.receiver.connected && model.receiver.videoSize != .zero
             && model.receiver.videoPresentation.isReady
+            && MacTargetRouting.admits(selected: macTargetPicker.selectedID, sender: model.receiver.connectedMacID)
     }
 
     private var showsDesktop: Bool {
@@ -96,7 +99,7 @@ struct ReceiverScreen: View {
 
     private var shouldCapturePointer: Bool {
         isStreaming && model.receiver.supportsRelativePointer
-            && !showRemoteTools && !showSettings && !showSoftwareKeyboard && !showMacLogin
+            && !showRemoteTools && !showSettings && !showSoftwareKeyboard && !showMacLogin && !showMacPicker
             && UIApplication.shared.applicationState == .active
     }
 
@@ -124,7 +127,7 @@ struct ReceiverScreen: View {
                                    receiver: model.receiver,
                                    useMetal: metalRenderer,
                                    softwareKeyboard: showSoftwareKeyboard,
-                                   inputEnabled: isStreaming && !showMacLogin && !showSettings,
+                                   inputEnabled: isStreaming && !showMacLogin && !showSettings && !showMacPicker,
                                    pointerCapture: pointerCapture,
                                    onToggleTools: {
                                        withAnimation(.easeInOut(duration: 0.15)) {
@@ -148,6 +151,7 @@ struct ReceiverScreen: View {
                                         model.receiver.sendKey(hid: 43, down: false)
                                     }
                                     Menu("Mac") {
+                                        Button("选择 Mac") { showMacPicker = true }
                                         Button("Mac 登录") { showMacLogin = true }
                                         Button("Switch input source (Control-Space)") {
                                             model.receiver.sendShortcut(hid: 44, modifierHID: 224)
@@ -205,10 +209,12 @@ struct ReceiverScreen: View {
                             .foregroundColor(.secondary).multilineTextAlignment(.center)
                         Button("Mac 登录") { showMacLogin = true }
                             .buttonStyle(.borderedProminent)
+                        Button("选择 Mac") { showMacPicker = true }
                     }.padding(32)
                 } else {
                     IdleView(receiver: model.receiver, showSettings: $showSettings,
-                             showMacLogin: $showMacLogin)
+                             showMacLogin: $showMacLogin, showMacPicker: $showMacPicker,
+                             targetName: macTargetPicker.usbOnly ? "USB 数据线所连的 Mac" : macTargetPicker.selected?.name)
                 }
             }
             // The window, not this view: a sheet, the keyboard or the
@@ -224,8 +230,19 @@ struct ReceiverScreen: View {
         .sheet(isPresented: $showSettings) {
             SettingsView(receiver: model.receiver)
         }
+        .sheet(isPresented: $showMacPicker) {
+            MacTargetPicker(model: macTargetPicker) { target, usbOnly in
+                guard macTargetPicker.selectedID != target?.id || macTargetPicker.usbOnly != usbOnly else { return }
+                macLoginSession.cancel()
+                model.receiver.resetRemoteInput()
+                model.receiver.selectMac(target?.id, usbOnly: usbOnly)
+                macTargetPicker.select(target, usbOnly: usbOnly)
+                showRemoteTools = false
+                showSoftwareKeyboard = false
+            }
+        }
         .fullScreenCover(isPresented: $showMacLogin) {
-            MacLoginView(session: macLoginSession)
+            MacLoginView(session: macLoginSession, target: macTargetPicker.selected, usbOnly: macTargetPicker.usbOnly)
         }
         .onChange(of: isStreaming && macLoginSession.authenticated) { ready in
             if ready { showMacLogin = false }
@@ -300,6 +317,10 @@ struct ReceiverScreen: View {
         .onAppear {
             UIApplication.shared.isIdleTimerDisabled = true
             pointerCapture.receiver = model.receiver
+            model.receiver.onMacIdentity = { [weak macTargetPicker] id, name, host in
+                macTargetPicker?.remember(id: id, name: name, host: host)
+            }
+            model.receiver.selectMac(macTargetPicker.selectedID, usbOnly: macTargetPicker.usbOnly)
             model.start()
             pointerCapture.enabled = shouldCapturePointer
             // Show the first-run hint unless the device has connected before
@@ -317,6 +338,8 @@ struct IdleView: View {
     @ObservedObject var receiver: StreamReceiver
     @Binding var showSettings: Bool
     @Binding var showMacLogin: Bool
+    @Binding var showMacPicker: Bool
+    let targetName: String?
 
     var body: some View {
         VStack(spacing: 28) {
@@ -330,6 +353,9 @@ struct IdleView: View {
             VStack(spacing: 6) {
                 Text("OpenDisplay")
                     .font(.largeTitle.bold())
+                if let targetName {
+                    Label(targetName, systemImage: "desktopcomputer").font(.subheadline)
+                }
                 HStack(spacing: 8) {
                     Circle()
                         .fill(receiver.connected ? Color.green : Color.orange)
@@ -356,13 +382,21 @@ struct IdleView: View {
 
             Spacer()
 
-            Button {
-                showMacLogin = true
-            } label: {
-                Label("Mac 登录", systemImage: "lock.open")
+            HStack {
+                Button {
+                    showMacLogin = true
+                } label: {
+                    Label("Mac 登录", systemImage: "lock.open")
+                }
+                .buttonStyle(.borderedProminent)
+                .accessibilityIdentifier("openMacLogin")
+                Button {
+                    showMacPicker = true
+                } label: {
+                    Label("选择 Mac", systemImage: "desktopcomputer")
+                }
+                .buttonStyle(.bordered)
             }
-            .buttonStyle(.borderedProminent)
-            .accessibilityIdentifier("openMacLogin")
 
             Button {
                 showSettings = true

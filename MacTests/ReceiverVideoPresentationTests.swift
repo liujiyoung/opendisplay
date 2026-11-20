@@ -52,6 +52,32 @@ final class ReceiverVideoPresentationTests: XCTestCase {
         XCTAssertNil(StreamHandoff.senderSession(in: frame("{\"type\":\"welcome\",\"senderSession\":\"\(id)\",\"screenLocked\":false}") + marker))
     }
 
+    func testSelectingMacAllowsItToDialEvenWhenNotPreviouslyRemembered() {
+        let selected = UUID()
+        let other = UUID()
+        XCTAssertTrue(MacTargetRouting.permitsAutomaticDial(local: selected, selected: selected, remembered: false))
+        XCTAssertFalse(MacTargetRouting.permitsAutomaticDial(local: other, selected: selected, remembered: true))
+        XCTAssertFalse(MacTargetRouting.permitsAutomaticDial(local: other, selected: nil, remembered: false))
+        XCTAssertTrue(MacTargetRouting.permitsAutomaticDial(local: other, selected: nil, remembered: true))
+    }
+
+    func testFirstFrameIdentifiesTheMacOnOrdinaryAndPreparedPaths() throws {
+        let selected = UUID()
+        func frame(_ type: String, id: UUID) throws -> Data {
+            let payload = try JSONSerialization.data(withJSONObject: ["type": type, "senderMac": id.uuidString])
+            return withUnsafeBytes(of: UInt32(payload.count).bigEndian) { Data($0) } + payload
+        }
+        let ordinary = try frame(WireMessage.senderIdentity, id: selected)
+        let handoff = try frame(WireMessage.streamHandoff, id: selected)
+        let wrongMac = try frame(WireMessage.senderIdentity, id: UUID())
+        XCTAssertTrue(MacTargetRouting.admits(selected: selected, sender: MacTargetRouting.sender(in: ordinary)))
+        XCTAssertTrue(MacTargetRouting.admits(selected: selected, sender: MacTargetRouting.sender(in: handoff)))
+        XCTAssertFalse(MacTargetRouting.admits(selected: selected, sender: MacTargetRouting.sender(in: wrongMac)))
+        XCTAssertFalse(MacTargetRouting.admits(selected: selected, sender: MacTargetRouting.sender(in: ordinary.dropLast())))
+        XCTAssertFalse(MacTargetRouting.admits(selected: selected, sender: MacTargetRouting.sender(in: try frame(WireMessage.welcome, id: selected))))
+        XCTAssertTrue(MacTargetRouting.admits(selected: nil, sender: nil))
+    }
+
     func testReconnectsWithoutVideoNeverPresentABlackVideoPage() {
         var state = ReceiverVideoPresentation()
         state.begin(1)

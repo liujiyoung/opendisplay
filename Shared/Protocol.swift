@@ -36,7 +36,33 @@ enum WireMessage {
     static let closing = "closing"                  // phone -> Mac: app quit, end the session for good
     static let streamConfig = "streamConfig"        // Mac -> receiver: selected video operating point
     static let streamHandoff = "streamHandoff"      // Mac -> receiver: first message on a prepared video path
+    static let senderIdentity = "senderIdentity"    // Mac -> receiver: first message on an ordinary video path
     static let power = "power"                      // Mac -> receiver: shut down (PROTOCOL.md 6.6)
+}
+
+/// Selection uses a per-install ID, independent of the host name, IP, or
+/// transport. This is routing on a trusted LAN, not peer authentication.
+enum MacTargetRouting {
+    static let service = "_opensidecar._tcp"
+    static let senderRole = "macSender"
+    static let selectionKey = "targetMac"
+    static let usbSelection = "usb"
+
+    static func admits(selected: UUID?, sender: UUID?) -> Bool {
+        selected == nil || selected == sender
+    }
+
+    static func permitsAutomaticDial(local: UUID, selected: UUID?, remembered: Bool) -> Bool {
+        selected.map { $0 == local } ?? remembered
+    }
+
+    static func sender(in bytes: Data) -> UUID? {
+        guard let object = StreamHandoff.leadingControl(in: bytes),
+              let type = object["type"] as? String,
+              type == WireMessage.senderIdentity || type == WireMessage.streamHandoff,
+              let id = object["senderMac"] as? String else { return nil }
+        return UUID(uuidString: id)
+    }
 }
 
 /// A handoff marker precedes codec setup and video on the replacement socket.
@@ -51,12 +77,16 @@ enum StreamHandoff {
     }
 
     static func senderSession(in bytes: Data) -> UUID? {
-        guard let size = leadingControlFrameSize(in: bytes), bytes.count >= size,
-              let object = try? JSONSerialization.jsonObject(with: Data(bytes.prefix(size).dropFirst(4))) as? [String: Any],
+        guard let object = leadingControl(in: bytes),
               object["type"] as? String == WireMessage.streamHandoff,
               object["screenLocked"] as? Bool == false,
               let id = object["senderSession"] as? String else { return nil }
         return UUID(uuidString: id)
+    }
+
+    static func leadingControl(in bytes: Data) -> [String: Any]? {
+        guard let size = leadingControlFrameSize(in: bytes), bytes.count >= size else { return nil }
+        return (try? JSONSerialization.jsonObject(with: Data(bytes.prefix(size).dropFirst(4)))) as? [String: Any]
     }
 }
 

@@ -2,18 +2,183 @@ import SwiftUI
 import WebKit
 import Network
 
+struct MacTarget: Codable, Equatable, Identifiable {
+    let id: UUID
+    let name: String
+    let host: String
+}
+
+final class MacTargetPickerModel: ObservableObject {
+    @Published private(set) var targets: [MacTarget]
+    @Published private(set) var selectedID: UUID?
+    @Published private(set) var usbOnly: Bool
+    @Published private(set) var visibleIDs: Set<UUID> = []
+    @Published private(set) var discoveryUnavailable = false
+    private var browser: NWBrowser?
+    private let defaults: UserDefaults
+
+    init(defaults: UserDefaults = .standard) {
+        self.defaults = defaults
+        targets = defaults.data(forKey: "macTargetList")
+            .flatMap { try? JSONDecoder().decode([MacTarget].self, from: $0) } ?? []
+        let raw = defaults.string(forKey: "macTargetSelection")
+        usbOnly = raw == MacTargetRouting.usbSelection
+        let storedID = raw.flatMap(UUID.init(uuidString:))
+        selectedID = targets.first(where: { $0.id == storedID })?.id
+    }
+
+    var selected: MacTarget? { targets.first { $0.id == selectedID } }
+
+    func select(_ target: MacTarget?, usbOnly: Bool = false) {
+        selectedID = target?.id
+        self.usbOnly = usbOnly
+        defaults.set(usbOnly ? MacTargetRouting.usbSelection : target?.id.uuidString,
+                     forKey: "macTargetSelection")
+    }
+
+    func remember(id: UUID, name: String, host: String) {
+        guard let endpoint = MacLoginEndpoint(host), endpoint.host.lowercased().hasSuffix(".local") else { return }
+        remember([MacTarget(id: id, name: name.isEmpty ? endpoint.host : String(name.prefix(80)), host: endpoint.host)])
+    }
+
+    private func remember(_ found: [MacTarget]) {
+        var merged = Dictionary(targets.map { ($0.id, $0) }, uniquingKeysWith: { first, _ in first })
+        for target in found { merged[target.id] = target }
+        let ordered = merged.values.sorted {
+            let order = $0.name.localizedStandardCompare($1.name)
+            return order == .orderedSame ? $0.id.uuidString < $1.id.uuidString : order == .orderedAscending
+        }
+        guard ordered != targets else { return }
+        targets = ordered
+        defaults.set(try? JSONEncoder().encode(ordered), forKey: "macTargetList")
+    }
+
+    func browse() {
+        guard browser == nil else { return }
+        let params = NWParameters.tcp
+        params.includePeerToPeer = true
+        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: MacTargetRouting.service, domain: "local."),
+                                using: params)
+        self.browser = browser
+        browser.browseResultsChangedHandler = { [weak self, weak browser] results, _ in
+            guard let self, let browser, self.browser === browser else { return }
+            let found: [MacTarget] = results.compactMap {
+                guard case .service(let name, _, _, _) = $0.endpoint, case .bonjour(let txt) = $0.metadata,
+                      txt["role"] == MacTargetRouting.senderRole,
+                      let id = txt["id"].flatMap(UUID.init(uuidString:)),
+                      let host = txt["host"].flatMap(MacLoginEndpoint.init)?.host,
+                      host.lowercased().hasSuffix(".local") else { return nil }
+                return MacTarget(id: id, name: name, host: host)
+            }
+            self.visibleIDs = Set(found.map(\.id))
+            self.remember(found)
+        }
+        browser.stateUpdateHandler = { [weak self, weak browser] state in
+            guard let self, let browser, self.browser === browser else { return }
+            switch state {
+            case .ready: self.discoveryUnavailable = false
+            case .waiting, .failed: self.discoveryUnavailable = true
+            default: break
+            }
+        }
+        browser.start(queue: .main)
+    }
+
+    func stopBrowsing() {
+        browser?.cancel()
+        browser = nil
+        visibleIDs = []
+        discoveryUnavailable = false
+    }
+}
+
+struct MacTargetPicker: View {
+    @Environment(\.dismiss) private var dismiss
+    @ObservedObject var model: MacTargetPickerModel
+    let choose: (MacTarget?, Bool) -> Void
+
+    var body: some View {
+        NavigationView {
+            List {
+                Section {
+                    row("自动（任意 Mac）", detail: "适合只有一台 Mac 的环境",
+                        selected: model.selectedID == nil && !model.usbOnly) { choose(nil, false) }
+                    row("USB 数据线所连的 Mac", detail: "仅通过 USB 显示及登录，无需 Wi‑Fi",
+                        selected: model.usbOnly) { choose(nil, true) }
+                }
+                Section {
+                    ForEach(model.targets) { target in
+                        row(target.name, detail: target.host + (model.visibleIDs.contains(target.id) ? "" : " · 当前未发现"),
+                            selected: model.selectedID == target.id) { choose(target, false) }
+                    }
+                    if model.targets.isEmpty {
+                        Label(model.discoveryUnavailable ? "无法搜索，请检查 OpenDisplay 的本地网络权限" : "正在搜索 Mac…",
+                              systemImage: "magnifyingglass")
+                            .foregroundColor(.secondary)
+                    }
+                } header: {
+                    Text("Mac")
+                } footer: {
+                    Text("请在两台 Mac 上运行支持此功能的 OpenDisplay。已选 Mac 的 USB、Wi‑Fi 直连和普通 Wi‑Fi 仍可自动切换。")
+                }
+            }
+            .navigationTitle("选择 Mac")
+            .navigationBarTitleDisplayMode(.inline)
+            .toolbar { ToolbarItem(placement: .navigationBarTrailing) { Button("完成") { dismiss() } } }
+        }
+        .navigationViewStyle(.stack)
+        .onAppear { model.browse() }
+        .onDisappear { model.stopBrowsing() }
+    }
+
+    private func row(_ name: String, detail: String, selected: Bool, action: @escaping () -> Void) -> some View {
+        Button {
+            action()
+            dismiss()
+        } label: {
+            HStack {
+                VStack(alignment: .leading, spacing: 4) {
+                    Text(name).foregroundColor(.primary)
+                    Text(detail).font(.footnote).foregroundColor(.secondary)
+                }
+                Spacer()
+                if selected { Image(systemName: "checkmark") }
+            }
+            .contentShape(Rectangle())
+        }
+        .accessibilityAddTraits(selected ? [.isSelected] : [])
+    }
+}
+
 /// A user-initiated bridge to macOS Screen Sharing, available before the sender's
 /// Aqua LaunchAgent can run. USB login requires the system relay and an unlocked
 /// data volume (FileVault off, or already unlocked).
 struct MacLoginView: View {
     @Environment(\.dismiss) private var dismiss
     @ObservedObject var session: MacLoginSession
+    let target: MacTarget?
+    let usbOnly: Bool
     @AppStorage("macLoginHost") private var host = ""
     @AppStorage("macLoginUsername") private var username = ""
+    @AppStorage("macTargetLoginUsernames") private var targetUsernames = Data()
     @State private var password = ""
     @AppStorage("macLoginConnectionMode") private var connectionMode = MacLoginConnectionMode.usb.rawValue
 
-    private var mode: MacLoginConnectionMode { MacLoginConnectionMode(rawValue: connectionMode) ?? .usb }
+    private var mode: MacLoginConnectionMode {
+        if usbOnly { return .usb }
+        if target != nil { return .network }
+        return MacLoginConnectionMode(rawValue: connectionMode) ?? .usb
+    }
+    private var loginHost: String { target?.host ?? host }
+    private var names: [String: String] { (try? JSONDecoder().decode([String: String].self, from: targetUsernames)) ?? [:] }
+    private var loginUsername: Binding<String> {
+        guard let id = target?.id.uuidString else { return $username }
+        return Binding(get: { names[id] ?? username }, set: { value in
+            var names = names
+            names[id] = value
+            if let data = try? JSONEncoder().encode(names) { targetUsernames = data }
+        })
+    }
 
     var body: some View {
         NavigationView {
@@ -36,19 +201,29 @@ struct MacLoginView: View {
                     Form {
                         Section {
                             Text("USB 登录无需 Wi-Fi：数据线直连 iPad 机身，Mac 需已安装 USB 登录服务。冷启动前须关闭 FileVault，或先解锁磁盘。登录后自动恢复 OpenDisplay。")
-                            Picker("连接方式", selection: $connectionMode) {
-                                Text("USB 数据线").tag(MacLoginConnectionMode.usb.rawValue)
-                                Text("局域网").tag(MacLoginConnectionMode.network.rawValue)
-                            }.pickerStyle(.segmented)
+                            if let target {
+                                Label(target.name, systemImage: "desktopcomputer")
+                            } else if usbOnly {
+                                Label("USB 数据线所连的 Mac", systemImage: "cable.connector")
+                            } else {
+                                Picker("连接方式", selection: $connectionMode) {
+                                    Text("USB 数据线").tag(MacLoginConnectionMode.usb.rawValue)
+                                    Text("局域网").tag(MacLoginConnectionMode.network.rawValue)
+                                }.pickerStyle(.segmented)
+                            }
                             inputOnlyToggle
                         }
                         Section(header: Text("Mac 账户")) {
                             if mode == .network {
-                                TextField("Mac 局域网 IP 或 .local 名称", text: $host)
-                                    .textInputAutocapitalization(.never).autocorrectionDisabled()
-                                    .keyboardType(.URL).accessibilityIdentifier("macLoginHost")
+                                if target != nil {
+                                    Text(loginHost).foregroundColor(.secondary)
+                                } else {
+                                    TextField("Mac 局域网 IP 或 .local 名称", text: $host)
+                                        .textInputAutocapitalization(.never).autocorrectionDisabled()
+                                        .keyboardType(.URL).accessibilityIdentifier("macLoginHost")
+                                }
                             }
-                            TextField("Mac 用户名", text: $username)
+                            TextField("Mac 用户名", text: loginUsername)
                                 .textInputAutocapitalization(.never).autocorrectionDisabled()
                                 .accessibilityIdentifier("macLoginUsername")
                             SecureField("Mac 登录密码", text: $password)
@@ -58,11 +233,11 @@ struct MacLoginView: View {
                             ? "使用已信任的 USB 数据线和 Mac 屏幕共享。无需地址或互联网；只保存用户名，密码不保存。"
                             : "使用 Mac 屏幕共享（端口 5900）。两端需能在局域网互访；只保存地址和用户名，密码不保存。")) {
                             Button("连接登录画面") {
-                                session.begin(host: host, username: username, password: password, mode: mode)
+                                session.begin(host: loginHost, username: loginUsername.wrappedValue, password: password, mode: mode)
                                 password = ""
                             }
-                            .disabled((mode == .network && MacLoginEndpoint(host) == nil)
-                                      || username.isEmpty || password.isEmpty)
+                            .disabled((mode == .network && MacLoginEndpoint(loginHost) == nil)
+                                      || loginUsername.wrappedValue.isEmpty || password.isEmpty)
                             .accessibilityIdentifier("macLoginConnect")
                         }
                         if !session.status.isEmpty {

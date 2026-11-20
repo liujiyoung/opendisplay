@@ -2,6 +2,46 @@ import SwiftUI
 import Network
 import Combine
 import Sparkle
+import SystemConfiguration
+
+enum LocalMacTarget {
+    static let id: UUID = {
+        let key = "localMacTargetID"
+        if let raw = UserDefaults.standard.string(forKey: key), let id = UUID(uuidString: raw) { return id }
+        let id = UUID()
+        UserDefaults.standard.set(id.uuidString, forKey: key)
+        return id
+    }()
+    static var name: String { SCDynamicStoreCopyComputerName(nil, nil) as String? ?? "Mac" }
+    static var host: String { (SCDynamicStoreCopyLocalHostName(nil) as String?).map { "\($0).local" } ?? "" }
+
+    // The discovery socket only publishes metadata. Actual login always goes
+    // to macOS Screen Sharing on port 5900.
+    static func advertise() -> NWListener? {
+        do {
+            let parameters = NWParameters.tcp
+            parameters.includePeerToPeer = true
+            let listener = try NWListener(using: parameters)
+            var txt = NWTXTRecord()
+            txt["role"] = MacTargetRouting.senderRole
+            txt["id"] = id.uuidString
+            txt["host"] = host
+            listener.service = NWListener.Service(name: name, type: MacTargetRouting.service, txtRecord: txt)
+            listener.newConnectionHandler = { $0.cancel() }
+            listener.stateUpdateHandler = { state in
+                if case .failed(let error) = state { Log.info("Mac discovery listener failed: \(error)") }
+            }
+            listener.serviceRegistrationUpdateHandler = { change in
+                if case .add = change { Log.info("Mac selection Bonjour advertisement registered") }
+            }
+            listener.start(queue: .main)
+            return listener
+        } catch {
+            Log.info("Mac discovery listener unavailable: \(error)")
+            return nil
+        }
+    }
+}
 
 /// How the app presents itself. One bundle, switched at runtime via the
 /// activation policy — like Raycast/Hammerspoon style background agents.
@@ -284,6 +324,7 @@ final class SenderController: ObservableObject {
 
     private var browser: NWBrowser?
     private var peerWiFiBrowser: NWBrowser?
+    private var macTargetService: NWListener?
     private var policyTimer: Timer?
     private var usbWatcher: UsbmuxDeviceWatcher?
     private var accessoryWatcher: AccessoryDeviceWatcher?
@@ -357,6 +398,7 @@ final class SenderController: ObservableObject {
     private var everOnCable: Set<String> = []
 
     init() {
+        macTargetService = LocalMacTarget.advertise()
         startBrowsing()
         updatePeerWiFiBrowsing()
         usbWatcher = UsbmuxDeviceWatcher { [weak self] devices in
@@ -384,11 +426,12 @@ final class SenderController: ObservableObject {
 
     private func startBrowsing() {
         // TXT records carry the receiver's install id (new receivers).
-        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_opensidecar._tcp", domain: nil), using: .tcp)
+        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: MacTargetRouting.service, domain: nil), using: .tcp)
         browser.browseResultsChangedHandler = { [weak self] results, _ in
             DispatchQueue.main.async {
                 guard let self else { return }
-                self.discovered = Array(results)
+                self.discovered = results.filter { !Self.isMacAdvertisement($0) }
+                self.retireUnselectedWirelessSessions(in: self.discovered)
                 self.endSessionsWhoseServiceVanished()
                 self.autoConnect()
                 self.connectNewlyCabled()
@@ -408,7 +451,7 @@ final class SenderController: ObservableObject {
         guard peerWiFiBrowser == nil else { return }
         let params = NWParameters.tcp
         params.includePeerToPeer = true
-        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: "_opensidecar._tcp", domain: nil),
+        let browser = NWBrowser(for: .bonjourWithTXTRecord(type: MacTargetRouting.service, domain: nil),
                                 using: params)
         peerWiFiStatus = ""
         peerWiFiBrowser = browser
@@ -419,12 +462,14 @@ final class SenderController: ObservableObject {
                 // advertisements received on the Apple peer-to-peer link.
                 var targets: [String: ConnectionTarget] = [:]
                 for result in results {
-                    guard let interface = result.interfaces.first(where: { $0.name == "awdl0" }),
+                    guard !Self.isMacAdvertisement(result),
+                          let interface = result.interfaces.first(where: { $0.name == "awdl0" }),
                           self.serviceName(of: result) != nil else { continue }
                     let target = ConnectionTarget.peerWiFi(result, interface)
                     targets[target.sessionID] = target
                 }
                 self.peerWiFiTargets = targets.values.sorted { $0.sessionID < $1.sessionID }
+                self.retireUnselectedWirelessSessions(in: self.peerWiFiTargets.compactMap(\.service))
                 self.autoConnect()
             }
         }
@@ -455,6 +500,11 @@ final class SenderController: ObservableObject {
     }
 
     // MARK: - Physical-device identity
+
+    private static func isMacAdvertisement(_ result: NWBrowser.Result) -> Bool {
+        if case .bonjour(let txt) = result.metadata { return txt["role"] == MacTargetRouting.senderRole }
+        return false
+    }
 
     private func serviceName(of result: NWBrowser.Result) -> String? {
         if case .service(let name, _, _, _) = result.endpoint { return name }
@@ -677,21 +727,45 @@ final class SenderController: ObservableObject {
                 session.sender.preferPeerWiFi(endpoint, interface: interface, installID: id)
             }
         }
-        guard wifiAutoConnectArmed,
-              autoReconnectWiFi || Date() < wifiAutoConnectDeadline else { return }
+        guard wifiAutoConnectArmed else { return }
         for result in discovered {
             let target = ConnectionTarget.wifi(result)
-            if wifiRemembered.contains(target.sessionID),
+            if shouldDialAutomatically(result, remembered: wifiRemembered.contains(target.sessionID)),
                activeSession(coveringWiFi: result) == nil,
                !cabled(result) {
                 connect(to: target)
             }
         }
         for target in peerWiFiTargets {
-            guard let result = target.service, let id = txtID(of: result),
-                  rememberedPeerIDs.contains(id), activeSession(coveringWiFi: result) == nil,
+            guard let result = target.service,
+                  shouldDialAutomatically(result, remembered: txtID(of: result).map(rememberedPeerIDs.contains) == true),
+                  activeSession(coveringWiFi: result) == nil,
                   !cabled(result) else { continue }
             connect(to: target)
+        }
+    }
+
+    private func shouldDialAutomatically(_ result: NWBrowser.Result, remembered: Bool) -> Bool {
+        let selection = macSelection(of: result)
+        guard selection != MacTargetRouting.usbSelection else { return false }
+        return MacTargetRouting.permitsAutomaticDial(
+            local: LocalMacTarget.id, selected: selection.flatMap(UUID.init(uuidString:)),
+            remembered: remembered && (autoReconnectWiFi || Date() < wifiAutoConnectDeadline))
+    }
+
+    private func macSelection(of result: NWBrowser.Result) -> String? {
+        guard case .bonjour(let txt) = result.metadata else { return nil }
+        return txt[MacTargetRouting.selectionKey]
+    }
+
+    private func retireUnselectedWirelessSessions(in services: [NWBrowser.Result]) {
+        for session in sessions where !session.onUSB {
+            guard let result = services.first(where: { matches($0, session: session) }),
+                  let selection = macSelection(of: result),
+                  selection != LocalMacTarget.id.uuidString else { continue }
+            // Keep the remembered device so changing the selection back can
+            // reconnect without requiring a click on this Mac.
+            end(session)
         }
     }
 
@@ -913,6 +987,8 @@ final class SenderController: ObservableObject {
     func connect(to target: ConnectionTarget, userInitiated: Bool = false,
                  awaitingWake: Bool = false) {
         guard connectionChoice != .sidecar else { return }
+        if let result = target.service, let selection = macSelection(of: result),
+           selection != LocalMacTarget.id.uuidString { return }
         let id = target.sessionID
         if let existing = session(for: id) {
             // A failed session holds no pipeline — replace the corpse
